@@ -15,6 +15,12 @@ from softmatcha.utils.custom_tqdm import CustomTqdm
 logger = logging.getLogger(__name__)
 _worker_tokenizer = None
 
+try:
+	from softmatcha_rs import init_vocab_rs as _init_vocab_rs, encode_and_spans_rs as _encode_and_spans_rs
+	_HAS_RUST_TOKENIZE = True
+except ImportError:
+	_HAS_RUST_TOKENIZE = False
+
 
 # =====================================================================================================================
 # Preparation
@@ -23,6 +29,10 @@ def init_worker(tokenizer: Tokenizer, cfg):
 	global _worker_tokenizer
 	_worker_tokenizer = tokenizer
 	tokenizer.build(cfg)
+	if _HAS_RUST_TOKENIZE:
+		keys = list(tokenizer.dictionary.keys())
+		values = [int(v) for v in tokenizer.dictionary.values()]
+		_init_vocab_rs(keys, values, int(tokenizer.unk_idx))
 
 def tokenize_count(line: str):
 	global _worker_tokenizer
@@ -32,11 +42,11 @@ def tokenize_count(line: str):
 def tokenize_encode_offsets(line: str):
 	global _worker_tokenizer
 	symbols = _worker_tokenizer.tokenize_raw(line)
-	token_ids = _worker_tokenizer.encode([sym.lower() for sym in symbols])
-	offsets = _worker_tokenizer.get_span_start_positions(
-		line,
-		symbols,
-	)
+	if _HAS_RUST_TOKENIZE:
+		token_ids, offsets = _encode_and_spans_rs(line, symbols)
+	else:
+		token_ids = _worker_tokenizer.encode([sym.lower() for sym in symbols])
+		offsets = _worker_tokenizer.get_span_start_positions(line, symbols)
 	return token_ids, offsets
 
 def get_custom_tqdm(num):
