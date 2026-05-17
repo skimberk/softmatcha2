@@ -6,6 +6,7 @@ import logging
 import numba as nb
 import numpy as np
 import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from softmatcha import stopwatch
 from softmatcha.tokenizers import Tokenizer
@@ -81,6 +82,34 @@ def read_random_chunk_safe(file_path, start_pos, chunk_size):
 		text = buffer.decode("utf-8", errors="replace")
 		return text, actual_byte_count
 
+
+def _read_chunk_with_fd(fd: int, start_pos: int, chunk_size: int, file_size: int):
+	"""Like read_random_chunk_safe but uses an already-open fd via os.pread (O4)."""
+	if start_pos >= file_size:
+		return "", 0
+	# Skip UTF-8 continuation bytes at the start position.
+	offset = 0
+	if start_pos > 0:
+		for offset in range(8):
+			raw = os.pread(fd, 1, start_pos + offset)
+			if not raw:
+				return "", 0
+			if not (0x80 <= raw[0] <= 0xBF):
+				break
+	read_start = start_pos + offset
+	raw_buf = bytearray(os.pread(fd, chunk_size, read_start))
+	# Consume trailing UTF-8 continuation bytes to avoid splitting a codepoint.
+	trail_pos = read_start + len(raw_buf)
+	while trail_pos < file_size:
+		b = os.pread(fd, 1, trail_pos)
+		if not b or not (0x80 <= b[0] <= 0xBF):
+			break
+		raw_buf += b
+		trail_pos += 1
+	actual_byte_count = len(raw_buf)
+	text = bytes(raw_buf).decode("utf-8", errors="replace")
+	return text, actual_byte_count
+
 def return_number_of_tokens(lines, num_workers, tokenizer):
 	with concurrent.futures.ProcessPoolExecutor(
 		max_workers=num_workers,
@@ -113,7 +142,11 @@ def tokenize(
 		# 1. count lines & estimate #tokens
 		# =============================================================================================================
 		# 1-0. make temporary files
-		LINES_SIZE = 4_096
+		# Pre-allocate based on file size to avoid repeated doubling resizes.
+		# Assume ~512 bytes/line on average with a 1.5× safety margin; fall back
+		# to doubling if the estimate is too small (same logic as before, just rare).
+		_file_size_for_est = os.path.getsize(input_file)
+		LINES_SIZE = max(4_096, int(_file_size_for_est / 512 * 1.5) + 4096)
 		index_path_ = Path(index_path)
 		index_path_.mkdir(parents=True, exist_ok=True)
 		if True:
@@ -124,35 +157,81 @@ def tokenize(
 			make_file(bin_path2, LINES_SIZE * 8)
 			lines_byt = np.memmap(bin_path2, dtype=np.uint64, mode='w+', shape=(LINES_SIZE,))
 
-		# 1-1. count number of lines
+		# 1-1. count number of lines (parallel block scan)
+		# Each worker thread reads a non-overlapping region of the file using
+		# os.pread() (no seek, thread-safe) and returns the byte positions of the
+		# start of every line in that region. np.where releases the GIL so threads
+		# run truly in parallel on both I/O and CPU.
+		_BLOCK = 64 * 1024 * 1024  # 64 MB read granularity
+
+		def _scan_region(fd: int, region_start: int, region_end: int) -> np.ndarray:
+			"""Return absolute byte positions of line starts inside [region_start, region_end)."""
+			parts: list[np.ndarray] = []
+			pos = region_start
+			while pos < region_end:
+				n = min(_BLOCK, region_end - pos)
+				block = os.pread(fd, n, pos)
+				if not block:
+					break
+				arr = np.frombuffer(block, dtype=np.uint8)
+				nl_offsets = np.where(arr == ord('\n'))[0]
+				if len(nl_offsets):
+					parts.append((pos + nl_offsets + 1).astype(np.uint64))
+				pos += len(block)
+			return np.concatenate(parts) if parts else np.empty(0, dtype=np.uint64)
+
 		bar1 = get_custom_tqdm(num_chunk)
 		num_lines = 0
-		with open(input_file, mode="rb") as f:
-			while True:
-				pos = f.tell()
-				bar1.update(pos // chunk - bar1.n)
 
-				# [a] update
-				lines_byt[num_lines] = pos
-				line = f.readline()
-				if not line:
-					break
-				num_lines += 1
+		# Determine last byte to handle files not ending with '\n'.
+		_last_byte_is_newline = True
+		if _file_size_for_est > 0:
+			with open(input_file, "rb") as _f:
+				_f.seek(-1, 2)
+				_last_byte_is_newline = (_f.read(1) == b'\n')
 
-				# [b] change filesize
-				if num_lines + 1024 > LINES_SIZE:
-					lines_tkn.flush()
-					lines_byt.flush()
-					gc.collect()
-					del lines_byt
-					del lines_tkn
-					LINES_SIZE *= 2
-					with open(bin_path1, "r+b") as f_resize:
-						f_resize.truncate(LINES_SIZE * 8)
-					with open(bin_path2, "r+b") as f_resize:
-						f_resize.truncate(LINES_SIZE * 8)
-					lines_tkn = np.memmap(bin_path1, dtype=np.uint64, mode='r+', shape=(LINES_SIZE,))
-					lines_byt = np.memmap(bin_path2, dtype=np.uint64, mode='r+', shape=(LINES_SIZE,))
+		_chunk_size = max(_BLOCK, (_file_size_for_est + num_workers - 1) // num_workers)
+		_regions = []
+		for _i in range(num_workers):
+			_s = _i * _chunk_size
+			if _s >= _file_size_for_est:
+				break
+			_regions.append((_s, min(_s + _chunk_size, _file_size_for_est)))
+
+		_fd = os.open(input_file, os.O_RDONLY)
+		try:
+			with ThreadPoolExecutor(max_workers=num_workers) as _pool:
+				_parts = list(_pool.map(lambda r: _scan_region(_fd, r[0], r[1]), _regions))
+		finally:
+			os.close(_fd)
+
+		# Merge: regions are processed in order, so concatenation is already sorted.
+		_all_starts = np.concatenate(_parts) if any(len(p) for p in _parts) else np.empty(0, dtype=np.uint64)
+		num_lines = len(_all_starts)
+
+		# Grow lines_byt / lines_tkn if the pre-allocation was too small (rare).
+		if num_lines + 2 > LINES_SIZE:
+			lines_tkn.flush(); lines_byt.flush(); gc.collect()
+			del lines_byt; del lines_tkn
+			LINES_SIZE = num_lines + 4096
+			with open(bin_path1, "r+b") as _fr: _fr.truncate(LINES_SIZE * 8)
+			with open(bin_path2, "r+b") as _fr: _fr.truncate(LINES_SIZE * 8)
+			lines_tkn = np.memmap(bin_path1, dtype=np.uint64, mode='r+', shape=(LINES_SIZE,))
+			lines_byt = np.memmap(bin_path2, dtype=np.uint64, mode='r+', shape=(LINES_SIZE,))
+
+		# Populate lines_byt: line 0 starts at byte 0, rest from scan.
+		lines_byt[0] = 0
+		if num_lines:
+			lines_byt[1 : num_lines + 1] = _all_starts
+
+		# If the file does not end with '\n', there is one more (partial) line.
+		if _file_size_for_est > 0 and not _last_byte_is_newline:
+			num_lines += 1
+			# Store the EOF position at lines_byt[num_lines], matching the original
+			# behaviour where the loop's final iteration sets this entry.
+			if num_lines < LINES_SIZE:
+				lines_byt[num_lines] = _file_size_for_est
+
 		bar1.update(bar1.total - bar1.n)
 		bar1.close()
 
@@ -168,15 +247,21 @@ def tokenize(
 			est_tokens = sub_token + 1024
 		
 		# 1-3. estimate number of tokens (large)
+		# O4: open the file once and use os.pread for all 40 000 random reads,
+		# eliminating 40 000 open()/close() syscall pairs.
 		else:
 			sub_chunk_est = 10_000
 			lines = []
-			for i in range(40_000):
-				pos = random.randint(0, os.path.getsize(input_file) - sub_chunk_est)
-				v, bytes = read_random_chunk_safe(input_file, pos, sub_chunk_est)
-				sub_bytes += bytes
-				for u in v.splitlines():
-					lines.append(u)
+			_est_fd = os.open(input_file, os.O_RDONLY)
+			try:
+				for i in range(40_000):
+					pos = random.randint(0, total_bytes - sub_chunk_est)
+					v, _nb = _read_chunk_with_fd(_est_fd, pos, sub_chunk_est, total_bytes)
+					sub_bytes += _nb
+					for u in v.splitlines():
+						lines.append(u)
+			finally:
+				os.close(_est_fd)
 			sub_token = return_number_of_tokens(lines, num_workers, tokenizer)
 			safe_ratio = 1.003 + 0.03 * ((2 ** num_retries) - 1)
 			est_tokens = int(safe_ratio * total_bytes * sub_token / sub_bytes)
