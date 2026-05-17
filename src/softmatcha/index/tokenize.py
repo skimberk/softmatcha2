@@ -17,14 +17,16 @@ logger = logging.getLogger(__name__)
 _worker_tokenizer = None
 
 try:
-	from softmatcha_rs import (
-		init_vocab_rs as _init_vocab_rs,
-		encode_and_spans_rs as _encode_and_spans_rs,
-		encode_and_spans_positions_rs as _encode_and_spans_positions_rs,
-	)
+	from softmatcha_rs import init_vocab_rs as _init_vocab_rs, encode_and_spans_rs as _encode_and_spans_rs
 	_HAS_RUST_TOKENIZE = True
 except ImportError:
 	_HAS_RUST_TOKENIZE = False
+
+try:
+	from softmatcha_rs import encode_and_spans_positions_rs as _encode_and_spans_positions_rs
+	_HAS_RUST_POSITIONS = True
+except ImportError:
+	_HAS_RUST_POSITIONS = False
 
 # Set to True in init_worker when the positions fast path is safe to use.
 # Requires: Rust available + ICU tokenizer with no URL/hyphen protection patterns.
@@ -71,7 +73,8 @@ def init_worker(tokenizer: Tokenizer, cfg):
 		# tokenize() rewrites some tokens before BreakIterator sees them, so we
 		# cannot bypass it and must fall back to the string-token path.
 		_USE_POSITIONS_PATH = (
-			hasattr(tokenizer, '_tokenizer')
+			_HAS_RUST_POSITIONS
+			and hasattr(tokenizer, '_tokenizer')
 			and hasattr(tokenizer._tokenizer, 'break_iterator')
 			and not getattr(tokenizer._tokenizer, 'protected_patterns', True)
 		)
