@@ -10,6 +10,7 @@ use crate::search::main::enumerate_candidates_rs;
 use crate::search::main::get_match_range_rs;
 use crate::tokenize::main::init_vocab_rs;
 use crate::tokenize::main::encode_and_spans_rs;
+use crate::tokenize::main::encode_and_spans_positions_rs;
 static INIT_LOGGER: Once = Once::new();
 
 
@@ -35,5 +36,6 @@ fn softmatcha_rs(m: &Bound<PyModule>) -> PyResult<()> {
 	m.add_function(wrap_pyfunction!(get_match_range_rs, m)?)?;
 	m.add_function(wrap_pyfunction!(init_vocab_rs, m)?)?;
 	m.add_function(wrap_pyfunction!(encode_and_spans_rs, m)?)?;
+	m.add_function(wrap_pyfunction!(encode_and_spans_positions_rs, m)?)?;
 	Ok(())
 }

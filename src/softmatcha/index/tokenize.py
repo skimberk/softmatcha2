@@ -17,10 +17,18 @@ logger = logging.getLogger(__name__)
 _worker_tokenizer = None
 
 try:
-	from softmatcha_rs import init_vocab_rs as _init_vocab_rs, encode_and_spans_rs as _encode_and_spans_rs
+	from softmatcha_rs import (
+		init_vocab_rs as _init_vocab_rs,
+		encode_and_spans_rs as _encode_and_spans_rs,
+		encode_and_spans_positions_rs as _encode_and_spans_positions_rs,
+	)
 	_HAS_RUST_TOKENIZE = True
 except ImportError:
 	_HAS_RUST_TOKENIZE = False
+
+# Set to True in init_worker when the positions fast path is safe to use.
+# Requires: Rust available + ICU tokenizer with no URL/hyphen protection patterns.
+_USE_POSITIONS_PATH = False
 
 # posix_fadvise hints — standard on Linux, graceful no-op everywhere else.
 # FADV_SEQUENTIAL: tell the kernel to prefetch ahead aggressively.
@@ -51,13 +59,22 @@ except Exception:
 # Preparation
 # =====================================================================================================================
 def init_worker(tokenizer: Tokenizer, cfg):
-	global _worker_tokenizer
+	global _worker_tokenizer, _USE_POSITIONS_PATH
 	_worker_tokenizer = tokenizer
 	tokenizer.build(cfg)
 	if _HAS_RUST_TOKENIZE:
 		keys = list(tokenizer.dictionary.keys())
 		values = [int(v) for v in tokenizer.dictionary.values()]
 		_init_vocab_rs(keys, values, int(tokenizer.unk_idx))
+		# Enable the positions fast path when the ICU tokenizer has no URL/hyphen
+		# protection patterns — the common case. With protection patterns active,
+		# tokenize() rewrites some tokens before BreakIterator sees them, so we
+		# cannot bypass it and must fall back to the string-token path.
+		_USE_POSITIONS_PATH = (
+			hasattr(tokenizer, '_tokenizer')
+			and hasattr(tokenizer._tokenizer, 'break_iterator')
+			and not getattr(tokenizer._tokenizer, 'protected_patterns', True)
+		)
 
 def tokenize_count(line: str):
 	global _worker_tokenizer
@@ -66,10 +83,19 @@ def tokenize_count(line: str):
 
 def tokenize_encode_offsets(line: str):
 	global _worker_tokenizer
-	symbols = _worker_tokenizer.tokenize_raw(line)
-	if _HAS_RUST_TOKENIZE:
+	if _USE_POSITIONS_PATH:
+		# Fast path: collect ICU char-boundary positions (N Python ints) and pass
+		# them directly to Rust — no intermediate Python string objects created.
+		bi = _worker_tokenizer._tokenizer.break_iterator
+		bi.setText(line)
+		token_ids, offsets = _encode_and_spans_positions_rs(line, list(bi))
+	elif _HAS_RUST_TOKENIZE:
+		# Rust encode+spans with string tokens (URL/hyphen protection active).
+		symbols = _worker_tokenizer.tokenize_raw(line)
 		token_ids, offsets = _encode_and_spans_rs(line, symbols)
 	else:
+		# Full Python fallback.
+		symbols = _worker_tokenizer.tokenize_raw(line)
 		token_ids = _worker_tokenizer.encode([sym.lower() for sym in symbols])
 		offsets = _worker_tokenizer.get_span_start_positions(line, symbols)
 	return token_ids, offsets

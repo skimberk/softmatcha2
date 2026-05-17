@@ -1,5 +1,6 @@
 """
-Correctness tests for the Rust encode_and_spans_rs / init_vocab_rs functions.
+Correctness tests for the Rust encode_and_spans_rs / init_vocab_rs /
+encode_and_spans_positions_rs functions.
 
 Each test compares the Rust output against the reference Python implementation
 in Tokenizer.encode() and Tokenizer.get_span_start_positions().
@@ -8,7 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from softmatcha_rs import encode_and_spans_rs, init_vocab_rs
+from softmatcha_rs import encode_and_spans_rs, encode_and_spans_positions_rs, init_vocab_rs
 from softmatcha.tokenizers.base import Tokenizer
 
 
@@ -224,3 +225,155 @@ class TestVocabInit:
         words = ["hello", "world", "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog"]
         d = {w: i for i, w in enumerate(words)}
         init_vocab_rs(list(d.keys()), [np.uint32(v) for v in d.values()], np.uint32(len(words)))
+
+
+# ---------------------------------------------------------------------------
+# encode_and_spans_positions_rs — the positions-based fast path
+# ---------------------------------------------------------------------------
+
+def _icu_char_ends(line: str) -> list[int]:
+    """Return raw BreakIterator char-end positions for line (no strip, no filtering)."""
+    from icu import BreakIterator, Locale
+    bi = BreakIterator.createWordInstance(Locale("en"))
+    bi.setText(line)
+    return list(bi)
+
+
+def _icu_tokens(line: str) -> list[str]:
+    """Return the whitespace-filtered token strings (mirrors apply_break_iterator)."""
+    from icu import BreakIterator, Locale
+    bi = BreakIterator.createWordInstance(Locale("en"))
+    bi.setText(line)
+    parts, p0 = [], 0
+    for p1 in bi:
+        part = line[p0:p1].strip()
+        if part:
+            parts.append(part)
+        p0 = p1
+    return parts
+
+
+class TestPositionsAPI:
+    """Tests for encode_and_spans_positions_rs: the positions-based ICU fast path.
+
+    The key invariant: for any line, encode_and_spans_positions_rs(line, list(bi))
+    must produce the same (token_ids, span_starts) as encode_and_spans_rs(line, tokens)
+    where tokens = apply_break_iterator(bi, line).
+    """
+
+    def test_empty_line(self, simple_vocab):
+        ids, spans = encode_and_spans_positions_rs("", [])
+        assert len(ids) == 0
+        assert len(spans) == 0
+
+    def test_empty_char_ends(self, simple_vocab):
+        """No boundaries at all → empty output."""
+        ids, spans = encode_and_spans_positions_rs("hello world", [])
+        assert len(ids) == 0
+
+    def test_whitespace_only_spans(self, simple_vocab):
+        """Whitespace-only spans must be filtered; no tokens returned for pure spaces."""
+        # All boundaries are within whitespace — no word tokens
+        ids, spans = encode_and_spans_positions_rs("   ", _icu_char_ends("   "))
+        assert len(ids) == 0
+
+    def test_ascii_equivalence(self, simple_vocab):
+        """Positions path matches string path on a basic ASCII sentence."""
+        d, unk = simple_vocab
+        line = "the quick brown fox"
+        char_ends = _icu_char_ends(line)
+        tokens = _icu_tokens(line)
+
+        rs_ids, rs_spans = encode_and_spans_rs(line, tokens)
+        pos_ids, pos_spans = encode_and_spans_positions_rs(line, char_ends)
+
+        np.testing.assert_array_equal(pos_ids, rs_ids)
+        np.testing.assert_array_equal(pos_spans, rs_spans)
+
+    def test_single_word(self, simple_vocab):
+        line = "hello"
+        char_ends = _icu_char_ends(line)
+        tokens = _icu_tokens(line)
+        rs_ids, rs_spans = encode_and_spans_rs(line, tokens)
+        pos_ids, pos_spans = encode_and_spans_positions_rs(line, char_ends)
+        np.testing.assert_array_equal(pos_ids, rs_ids)
+        np.testing.assert_array_equal(pos_spans, rs_spans)
+
+    def test_repeated_word(self, simple_vocab):
+        """Repeated tokens — positions must advance, not reuse first occurrence."""
+        line = "the dog the fox"
+        char_ends = _icu_char_ends(line)
+        tokens = _icu_tokens(line)
+        rs_ids, rs_spans = encode_and_spans_rs(line, tokens)
+        pos_ids, pos_spans = encode_and_spans_positions_rs(line, char_ends)
+        np.testing.assert_array_equal(pos_ids, rs_ids)
+        np.testing.assert_array_equal(pos_spans, rs_spans)
+        # Spans must be strictly increasing
+        for i in range(1, len(pos_spans)):
+            assert pos_spans[i] > pos_spans[i - 1]
+
+    def test_unknown_tokens(self, simple_vocab):
+        """Tokens not in vocab get unk_idx."""
+        d, unk = simple_vocab
+        line = "hello unknown world"
+        char_ends = _icu_char_ends(line)
+        pos_ids, pos_spans = encode_and_spans_positions_rs(line, char_ends)
+        tokens = _icu_tokens(line)
+        assert pos_ids[tokens.index("hello")] == d["hello"]
+        assert pos_ids[tokens.index("unknown")] == unk
+        assert pos_ids[tokens.index("world")] == d["world"]
+
+    def test_leading_whitespace_line(self, simple_vocab):
+        """Leading whitespace in the line: spans relative to original (not stripped) line."""
+        line = "  the quick"
+        char_ends = _icu_char_ends(line)
+        tokens = _icu_tokens(line)
+        rs_ids, rs_spans = encode_and_spans_rs(line, tokens)
+        pos_ids, pos_spans = encode_and_spans_positions_rs(line, char_ends)
+        np.testing.assert_array_equal(pos_ids, rs_ids)
+        np.testing.assert_array_equal(pos_spans, rs_spans)
+        # "the" must NOT start at byte 0 — it starts after the two leading spaces
+        assert pos_spans[0] == 2
+
+    def test_output_dtype(self, simple_vocab):
+        ids, spans = encode_and_spans_positions_rs("the quick", _icu_char_ends("the quick"))
+        assert ids.dtype == np.uint32
+        assert spans.dtype == np.uint32
+
+    def test_utf8_equivalence(self):
+        """Positions path matches string path on UTF-8 multi-byte input."""
+        words = ["héllo", "wörld", "café", "naïve"]
+        d = {w: i for i, w in enumerate(words)}
+        unk = len(words)
+        init_vocab_rs(list(d.keys()), [np.uint32(v) for v in d.values()], np.uint32(unk))
+
+        line = "héllo wörld café naïve"
+        char_ends = _icu_char_ends(line)
+        tokens = _icu_tokens(line)
+        rs_ids, rs_spans = encode_and_spans_rs(line, tokens)
+        pos_ids, pos_spans = encode_and_spans_positions_rs(line, char_ends)
+        np.testing.assert_array_equal(pos_ids, rs_ids)
+        np.testing.assert_array_equal(pos_spans, rs_spans)
+
+        # Restore simple vocab
+        simple_words = ["hello", "world", "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog"]
+        sd = {w: i for i, w in enumerate(simple_words)}
+        init_vocab_rs(list(sd.keys()), [np.uint32(v) for v in sd.values()], np.uint32(len(simple_words)))
+
+    def test_byte_offset_not_char_offset(self):
+        """Span starts must be UTF-8 byte offsets, not character offsets."""
+        words = ["héllo", "wörld"]
+        d = {w: i for i, w in enumerate(words)}
+        init_vocab_rs(list(d.keys()), [np.uint32(v) for v in d.values()], np.uint32(len(words)))
+
+        line = "héllo wörld"
+        char_ends = _icu_char_ends(line)
+        pos_ids, pos_spans = encode_and_spans_positions_rs(line, char_ends)
+        # "héllo " in UTF-8: h(1)+é(2)+l(1)+l(1)+o(1)+' '(1) = 7 bytes
+        assert pos_spans[0] == 0   # "héllo" starts at byte 0
+        assert pos_spans[1] == 7   # "wörld" starts at byte 7 (not char 6)
+
+        # Restore simple vocab
+        simple_words = ["hello", "world", "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog"]
+        sd = {w: i for i, w in enumerate(simple_words)}
+        init_vocab_rs(list(sd.keys()), [np.uint32(v) for v in sd.values()], np.uint32(len(simple_words)))

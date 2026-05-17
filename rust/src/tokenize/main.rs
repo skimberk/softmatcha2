@@ -35,6 +35,111 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Combined encode + span calculation from ICU BreakIterator char-end positions.
+///
+/// This is the high-performance replacement for encode_and_spans_rs. Instead of receiving
+/// a list[str] of token strings (which requires N Python string allocations per line), it
+/// receives the raw char-end positions from pyicu's BreakIterator (just N Python ints).
+///
+/// char_ends: the boundary positions produced by `list(break_iterator)` in Python — each
+///            value is the char index AFTER a span, in strictly ascending order.
+/// line: the original text that was passed to break_iterator.setText().
+///
+/// Rust walks char_indices() once (O(L)) to convert char positions to byte positions,
+/// then filters whitespace-only spans, trims, lowercases, and does vocab lookup —
+/// all in one pass without any intermediate Python string objects.
+///
+/// Returns (token_ids, span_start_bytes) as numpy u32 arrays.
+/// Requires init_vocab_rs to have been called in this process first.
+#[pyfunction]
+pub fn encode_and_spans_positions_rs<'py>(
+    py: Python<'py>,
+    line: String,
+    char_ends: Vec<u32>,
+) -> PyResult<(Bound<'py, PyArray1<u32>>, Bound<'py, PyArray1<u32>>)> {
+    let n_ends = char_ends.len();
+    if n_ends == 0 {
+        return Ok((
+            PyArray1::from_vec(py, vec![]),
+            PyArray1::from_vec(py, vec![]),
+        ));
+    }
+
+    let line_bytes = line.as_bytes();
+
+    // Step 1: Walk char_indices() once to map each char-end position → its byte offset.
+    // char_ends is strictly ascending (BreakIterator guarantees this).
+    // The byte END of the span that ends at char C is the byte START of char C.
+    let mut byte_ends: Vec<usize> = Vec::with_capacity(n_ends);
+    let mut end_idx = 0usize;
+    let mut char_count = 0usize;
+
+    for (byte_off, _) in line.char_indices() {
+        // Flush all char_ends that equal the current char index.
+        while end_idx < n_ends && char_ends[end_idx] as usize == char_count {
+            byte_ends.push(byte_off);
+            end_idx += 1;
+        }
+        if end_idx >= n_ends {
+            break;
+        }
+        char_count += 1;
+    }
+    // Any remaining char_ends at or past EOF → use the total byte length.
+    while end_idx < n_ends {
+        byte_ends.push(line_bytes.len());
+        end_idx += 1;
+    }
+
+    // Step 2: Process each span [prev_byte..byte_end), trimming whitespace and encoding.
+    let mut token_ids: Vec<u32> = Vec::with_capacity(n_ends / 2 + 1);
+    let mut span_starts: Vec<u32> = Vec::with_capacity(n_ends / 2 + 1);
+    let mut prev_byte = 0usize;
+
+    VOCAB.with(|v| {
+        let vocab = v.borrow();
+        let unk = UNK_IDX.with(|u| u.get());
+
+        for byte_end in &byte_ends {
+            let byte_end = *byte_end;
+            let span = &line_bytes[prev_byte..byte_end];
+            let span_start = prev_byte;
+            prev_byte = byte_end;
+
+            // Trim ASCII whitespace — mirrors Python's str.strip().
+            let lead = span.iter().take_while(|&&b| b.is_ascii_whitespace()).count();
+            let tail  = span.iter().rev().take_while(|&&b| b.is_ascii_whitespace()).count();
+            if lead + tail >= span.len() {
+                continue; // whitespace-only span: skip
+            }
+            let token_bytes = &span[lead..span.len() - tail];
+            let token_byte_start = (span_start + lead) as u32;
+
+            // Validate UTF-8 and get a &str view (ICU input is always valid UTF-8).
+            let token_str = match std::str::from_utf8(token_bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            // Lowercase for vocab lookup. Avoid allocation when already lowercase.
+            let lower_owned: Option<String> = if token_str.bytes().any(|b| b.is_ascii_uppercase()) {
+                Some(token_str.to_lowercase())
+            } else {
+                None
+            };
+            let lookup: &str = lower_owned.as_deref().unwrap_or(token_str);
+
+            span_starts.push(token_byte_start);
+            token_ids.push(vocab.get(lookup).copied().unwrap_or(unk));
+        }
+    });
+
+    Ok((
+        PyArray1::from_vec(py, token_ids),
+        PyArray1::from_vec(py, span_starts),
+    ))
+}
+
 /// Combined encode + get_span_start_positions for a single line.
 ///
 /// Returns (token_ids, span_start_bytes) as numpy u32 arrays.

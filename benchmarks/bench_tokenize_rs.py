@@ -17,7 +17,8 @@ import time
 import random
 import string
 import numpy as np
-from softmatcha_rs import init_vocab_rs, encode_and_spans_rs
+from icu import BreakIterator, Locale
+from softmatcha_rs import init_vocab_rs, encode_and_spans_rs, encode_and_spans_positions_rs
 from softmatcha.tokenizers.base import Tokenizer
 
 
@@ -94,10 +95,33 @@ def time_python(lines: list[tuple[str, list[str]]], dictionary: dict[str, int], 
     return time.perf_counter() - t0
 
 
-def time_rust(lines: list[tuple[str, list[str]]]) -> float:
+def _apply_bi_strings(bi: BreakIterator, text: str) -> list[str]:
+    """Reference apply_break_iterator: ICU boundaries → filtered list[str]."""
+    bi.setText(text)
+    parts, p0 = [], 0
+    for p1 in bi:
+        part = text[p0:p1].strip()
+        if part:
+            parts.append(part)
+        p0 = p1
+    return parts
+
+
+def time_full_string(lines: list[tuple[str, list[str]]], bi: BreakIterator) -> float:
+    """Current production path: ICU setText→list[str] → encode_and_spans_rs."""
     t0 = time.perf_counter()
-    for line, tokens in lines:
+    for line, _ in lines:
+        tokens = _apply_bi_strings(bi, line)
         encode_and_spans_rs(line, tokens)
+    return time.perf_counter() - t0
+
+
+def time_full_positions(lines: list[tuple[str, list[str]]], bi: BreakIterator) -> float:
+    """New fast path: ICU setText→list[int] → encode_and_spans_positions_rs."""
+    t0 = time.perf_counter()
+    for line, _ in lines:
+        bi.setText(line)
+        encode_and_spans_positions_rs(line, list(bi))
     return time.perf_counter() - t0
 
 
@@ -109,7 +133,8 @@ def total_tokens(lines: list[tuple[str, list[str]]]) -> int:
 # Main
 # ---------------------------------------------------------------------------
 
-def run_benchmark(n_lines: int, avg_words: int, warmup: int, runs: int, label: str):
+def run_benchmark(n_lines: int, avg_words: int, warmup: int, runs: int, label: str,
+                  bi: BreakIterator):
     lines = generate_lines(n_lines, avg_words)
     ntok = total_tokens(lines)
     print(f"\n{'─'*60}")
@@ -119,23 +144,26 @@ def run_benchmark(n_lines: int, avg_words: int, warmup: int, runs: int, label: s
     # Warmup
     for _ in range(warmup):
         time_python(lines, vocab, unk_idx)
-        time_rust(lines)
+        time_full_string(lines, bi)
+        time_full_positions(lines, bi)
 
-    py_times, rs_times = [], []
+    py_times, str_times, pos_times = [], [], []
     for _ in range(runs):
         py_times.append(time_python(lines, vocab, unk_idx))
-        rs_times.append(time_rust(lines))
+        str_times.append(time_full_string(lines, bi))
+        pos_times.append(time_full_positions(lines, bi))
 
     py_best = min(py_times)
-    rs_best = min(rs_times)
+    str_best = min(str_times)
+    pos_best = min(pos_times)
 
-    py_mtok = ntok / py_best / 1e6
-    rs_mtok = ntok / rs_best / 1e6
-    speedup = py_best / rs_best
+    py_mtok  = ntok / py_best  / 1e6
+    str_mtok = ntok / str_best / 1e6
+    pos_mtok = ntok / pos_best / 1e6
 
-    print(f"  Python  best={py_best*1000:7.1f} ms   {py_mtok:6.2f} Mtok/s")
-    print(f"  Rust    best={rs_best*1000:7.1f} ms   {rs_mtok:6.2f} Mtok/s")
-    print(f"  Speedup: {speedup:.1f}×")
+    print(f"  Python (ICU+encode+spans)          best={py_best*1000:7.1f} ms   {py_mtok:5.2f} Mtok/s")
+    print(f"  Rust strings  (ICU→list[str]→Rust) best={str_best*1000:7.1f} ms   {str_mtok:5.2f} Mtok/s   {py_best/str_best:.1f}× over Python")
+    print(f"  Rust positions(ICU→list[int]→Rust) best={pos_best*1000:7.1f} ms   {pos_mtok:5.2f} Mtok/s   {py_best/pos_best:.1f}× over Python   {str_best/pos_best:.2f}× over strings")
 
 
 if __name__ == "__main__":
@@ -157,11 +185,13 @@ if __name__ == "__main__":
     print(f"\nVocab size: {len(vocab):,} | unk_idx: {unk_idx}")
     print(f"Warmup: {args.warmup}  |  Runs: {args.runs}  |  Reporting best-of-{args.runs}")
 
+    bi = BreakIterator.createWordInstance(Locale("en"))
+
     for avg_words, label in [
         (10, "short lines (~10 words)"),
         (100, "medium lines (~100 words)"),
         (1000, "long lines (~1000 words)"),
     ]:
-        run_benchmark(args.lines, avg_words, args.warmup, args.runs, label)
+        run_benchmark(args.lines, avg_words, args.warmup, args.runs, label, bi)
 
     print()
