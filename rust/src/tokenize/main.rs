@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 use numpy::PyArray1;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -213,12 +214,16 @@ pub fn encode_and_spans_positions_rs<'py>(
 /// Equivalent to calling tokenizer.encode([t.lower() for t in raw_tokens]) and
 /// tokenizer.get_span_start_positions(line, raw_tokens) from Python, but in one Rust pass.
 ///
+/// `raw_tokens` is borrowed directly from Python's list — no String copies are made.
+/// This eliminates the N malloc+memcpy on entry and N free on exit that were the dominant
+/// hotspot (drop_in_place<Vec<String>>) in the py-spy profile.
+///
 /// Requires init_vocab_rs to have been called in this process first.
 #[pyfunction]
 pub fn encode_and_spans_rs<'py>(
     py: Python<'py>,
-    line: String,
-    raw_tokens: Vec<String>,
+    line: &str,                       // borrow Python's str buffer, no copy
+    raw_tokens: &Bound<'py, PyList>, // borrow Python's list, no String copies
 ) -> PyResult<(Bound<'py, PyArray1<u32>>, Bound<'py, PyArray1<u32>>)> {
     let n = raw_tokens.len();
     let mut token_ids = vec![0u32; n];
@@ -227,11 +232,19 @@ pub fn encode_and_spans_rs<'py>(
     let line_bytes = line.as_bytes();
     let mut byte_pos = 0usize;
 
-    VOCAB.with(|v| {
+    // Pre-fetch item handles (just pointer-sized Bound refs, no String data copied).
+    let items: Vec<Bound<'py, PyAny>> = (0..n)
+        .map(|i| raw_tokens.get_item(i))
+        .collect::<PyResult<_>>()?;
+
+    VOCAB.with(|v| -> PyResult<()> {
         let vocab = v.borrow();
         let unk = UNK_IDX.with(|u| u.get());
 
-        for (i, raw_token) in raw_tokens.iter().enumerate() {
+        for (i, item) in items.iter().enumerate() {
+            // Borrow the UTF-8 bytes directly from Python's PyUnicode internal buffer.
+            // No allocation: raw_token is a &str pointing into Python-managed memory.
+            let raw_token: &str = item.extract::<&str>()?;
             let token_bytes = raw_token.as_bytes();
 
             // Find byte offset of this token in the line from the current scan position.
@@ -243,7 +256,7 @@ pub fn encode_and_spans_rs<'py>(
             }
 
             // Hash token bytes (lowercasing only if uppercase present) and look up.
-            // No String allocation for already-lowercase tokens (the common case).
+            // Only allocates a String for the rare uppercase-token case.
             let hash = if token_bytes.iter().any(|b| b.is_ascii_uppercase()) {
                 fxhash64(raw_token.to_lowercase().as_bytes())
             } else {
@@ -251,7 +264,8 @@ pub fn encode_and_spans_rs<'py>(
             };
             token_ids[i] = vocab.get(&hash).copied().unwrap_or(unk);
         }
-    });
+        Ok(())
+    })?;
 
     Ok((
         PyArray1::from_vec(py, token_ids),
