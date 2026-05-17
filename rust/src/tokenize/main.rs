@@ -2,13 +2,77 @@ use pyo3::prelude::*;
 use numpy::PyArray1;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
 
+// ---------------------------------------------------------------------------
+// Fast inline FxHash64 — deterministic, no external dependency.
+// Same algorithm used by rustc and Firefox; produces well-distributed 64-bit
+// values for the short strings (< 30 chars) typical in NLP vocabularies.
+// ---------------------------------------------------------------------------
+#[inline]
+fn fxhash64(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x517cc1b727220a95;
+    let mut hash: u64 = 0;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().unwrap());
+        hash = hash.rotate_left(5) ^ word;
+        hash = hash.wrapping_mul(K);
+    }
+    for &b in chunks.remainder() {
+        hash = hash.rotate_left(5) ^ (b as u64);
+        hash = hash.wrapping_mul(K);
+    }
+    hash
+}
+
+// ---------------------------------------------------------------------------
+// Identity hasher — vocab keys ARE fxhash64 outputs (well-distributed u64),
+// so pass them straight through rather than hashing again.
+// Eliminates the AHash re-hash cost (~3 ns/lookup) on top of fxhash64.
+// ---------------------------------------------------------------------------
+#[derive(Default, Clone)]
+struct IdentityHasher(u64);
+
+impl Hasher for IdentityHasher {
+    #[inline]
+    fn write_u64(&mut self, i: u64) { self.0 = i; }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // Defensive fallback; for u64 keys Rust always calls write_u64.
+        if bytes.len() == 8 {
+            self.0 = u64::from_ne_bytes(bytes.try_into().unwrap());
+        }
+    }
+    #[inline]
+    fn finish(&self) -> u64 { self.0 }
+}
+
+#[derive(Default, Clone)]
+struct BuildIdentityHasher;
+
+impl BuildHasher for BuildIdentityHasher {
+    type Hasher = IdentityHasher;
+    #[inline]
+    fn build_hasher(&self) -> IdentityHasher { IdentityHasher(0) }
+}
+
+// ---------------------------------------------------------------------------
+// Thread-local state
+// Keys: fxhash64(lowercase_word_bytes) — avoids storing heap-allocated Strings
+// and eliminates the string memcmp (→ __memcmp_evex_movbe) during lookup.
+// ---------------------------------------------------------------------------
 thread_local! {
-    static VOCAB: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
+    static VOCAB: RefCell<HashMap<u64, u32, BuildIdentityHasher>> =
+        RefCell::new(HashMap::with_hasher(BuildIdentityHasher));
     static UNK_IDX: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Initialize the thread-local vocabulary. Call once per worker process after the tokenizer is built.
+/// Initialize the thread-local vocabulary. Call once per worker process after
+/// the tokenizer is built.
+///
+/// Keys are hashed to u64 via fxhash64(lowercase_bytes) so that lookup only
+/// needs a u64 comparison instead of a full string memcmp.
 #[pyfunction]
 pub fn init_vocab_rs(keys: Vec<String>, values: Vec<u32>, unk_idx: u32) -> PyResult<()> {
     UNK_IDX.with(|u| u.set(unk_idx));
@@ -17,7 +81,13 @@ pub fn init_vocab_rs(keys: Vec<String>, values: Vec<u32>, unk_idx: u32) -> PyRes
         map.clear();
         map.reserve(keys.len());
         for (k, id) in keys.into_iter().zip(values) {
-            map.insert(k, id);
+            // Lowercase defensively (vocab should already be lowercase in practice).
+            let hash = if k.bytes().any(|b| b.is_ascii_uppercase()) {
+                fxhash64(k.to_lowercase().as_bytes())
+            } else {
+                fxhash64(k.as_bytes())
+            };
+            map.insert(hash, id);
         }
     });
     Ok(())
@@ -46,8 +116,8 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// line: the original text that was passed to break_iterator.setText().
 ///
 /// Rust walks char_indices() once (O(L)) to convert char positions to byte positions,
-/// then filters whitespace-only spans, trims, lowercases, and does vocab lookup —
-/// all in one pass without any intermediate Python string objects.
+/// then filters whitespace-only spans, trims, hashes the token bytes, and does vocab
+/// lookup — all in one pass without any intermediate Python string objects.
 ///
 /// Returns (token_ids, span_start_bytes) as numpy u32 arrays.
 /// Requires init_vocab_rs to have been called in this process first.
@@ -69,13 +139,11 @@ pub fn encode_and_spans_positions_rs<'py>(
 
     // Step 1: Walk char_indices() once to map each char-end position → its byte offset.
     // char_ends is strictly ascending (BreakIterator guarantees this).
-    // The byte END of the span that ends at char C is the byte START of char C.
     let mut byte_ends: Vec<usize> = Vec::with_capacity(n_ends);
     let mut end_idx = 0usize;
     let mut char_count = 0usize;
 
     for (byte_off, _) in line.char_indices() {
-        // Flush all char_ends that equal the current char index.
         while end_idx < n_ends && char_ends[end_idx] as usize == char_count {
             byte_ends.push(byte_off);
             end_idx += 1;
@@ -91,7 +159,7 @@ pub fn encode_and_spans_positions_rs<'py>(
         end_idx += 1;
     }
 
-    // Step 2: Process each span [prev_byte..byte_end), trimming whitespace and encoding.
+    // Step 2: Process each span — trim whitespace, hash bytes, vocab lookup.
     let mut token_ids: Vec<u32> = Vec::with_capacity(n_ends / 2 + 1);
     let mut span_starts: Vec<u32> = Vec::with_capacity(n_ends / 2 + 1);
     let mut prev_byte = 0usize;
@@ -115,22 +183,21 @@ pub fn encode_and_spans_positions_rs<'py>(
             let token_bytes = &span[lead..span.len() - tail];
             let token_byte_start = (span_start + lead) as u32;
 
-            // Validate UTF-8 and get a &str view (ICU input is always valid UTF-8).
+            // Validate UTF-8 (ICU input is always valid, but be defensive).
             let token_str = match std::str::from_utf8(token_bytes) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
 
-            // Lowercase for vocab lookup. Avoid allocation when already lowercase.
-            let lower_owned: Option<String> = if token_str.bytes().any(|b| b.is_ascii_uppercase()) {
-                Some(token_str.to_lowercase())
+            // Hash the token bytes for lookup. Only allocate for uppercase tokens.
+            let hash = if token_str.bytes().any(|b| b.is_ascii_uppercase()) {
+                fxhash64(token_str.to_lowercase().as_bytes())
             } else {
-                None
+                fxhash64(token_bytes)
             };
-            let lookup: &str = lower_owned.as_deref().unwrap_or(token_str);
 
             span_starts.push(token_byte_start);
-            token_ids.push(vocab.get(lookup).copied().unwrap_or(unk));
+            token_ids.push(vocab.get(&hash).copied().unwrap_or(unk));
         }
     });
 
@@ -168,23 +235,21 @@ pub fn encode_and_spans_rs<'py>(
             let token_bytes = raw_token.as_bytes();
 
             // Find byte offset of this token in the line from the current scan position.
-            // Searching bytes directly gives the UTF-8 byte offset without a char→byte round-trip.
             if let Some(offset) = find_subslice(&line_bytes[byte_pos..], token_bytes) {
                 span_starts[i] = (byte_pos + offset) as u32;
                 byte_pos += offset + token_bytes.len().max(1);
             } else {
-                // Token not found — use current position as a safe fallback.
                 span_starts[i] = byte_pos as u32;
             }
 
-            // Lowercase for vocabulary lookup. Skip the allocation when already lowercase (common).
-            let is_upper = raw_token.bytes().any(|b| b.is_ascii_uppercase());
-            let lower: String = if is_upper {
-                raw_token.to_lowercase()
+            // Hash token bytes (lowercasing only if uppercase present) and look up.
+            // No String allocation for already-lowercase tokens (the common case).
+            let hash = if token_bytes.iter().any(|b| b.is_ascii_uppercase()) {
+                fxhash64(raw_token.to_lowercase().as_bytes())
             } else {
-                raw_token.clone()
+                fxhash64(token_bytes)
             };
-            token_ids[i] = vocab.get(lower.as_str()).copied().unwrap_or(unk);
+            token_ids[i] = vocab.get(&hash).copied().unwrap_or(unk);
         }
     });
 
