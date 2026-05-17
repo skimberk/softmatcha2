@@ -22,6 +22,30 @@ try:
 except ImportError:
 	_HAS_RUST_TOKENIZE = False
 
+# posix_fadvise hints — standard on Linux, graceful no-op everywhere else.
+# FADV_SEQUENTIAL: tell the kernel to prefetch ahead aggressively.
+# FADV_DONTNEED:   tell the kernel we are done with a region; evict it from
+#                  page cache immediately so RAM is free for the next read.
+#                  Without this, reading a 600 GB file on a 128 GB machine
+#                  causes the kernel to thrash its own cache (visible as high
+#                  %wa and %sy in top).
+try:
+	import ctypes as _ctypes
+	import ctypes.util as _ctu
+	_libc = _ctypes.CDLL(_ctu.find_library("c"), use_errno=True)
+	_FADV_SEQUENTIAL = 2
+	_FADV_DONTNEED   = 4
+	# Probe that the symbol actually exists (it does not on macOS).
+	_posix_fadvise = _libc.posix_fadvise
+	def _fadvise(fd: int, offset: int, length: int, advice: int) -> None:
+		_posix_fadvise(fd,
+		               _ctypes.c_long(offset),
+		               _ctypes.c_long(length),
+		               _ctypes.c_int(advice))
+except Exception:
+	def _fadvise(fd: int, offset: int, length: int, advice: int) -> None:
+		pass  # macOS / Windows: no-op
+
 
 # =====================================================================================================================
 # Preparation
@@ -162,10 +186,12 @@ def tokenize(
 		# os.pread() (no seek, thread-safe) and returns the byte positions of the
 		# start of every line in that region. np.where releases the GIL so threads
 		# run truly in parallel on both I/O and CPU.
-		_BLOCK = 64 * 1024 * 1024  # 64 MB read granularity
+		_BLOCK = 256 * 1024 * 1024  # 256 MB — fewer pread() syscalls than 64 MB
 
 		def _scan_region(fd: int, region_start: int, region_end: int) -> np.ndarray:
 			"""Return absolute byte positions of line starts inside [region_start, region_end)."""
+			# Hint: read this region sequentially → aggressive kernel prefetch.
+			_fadvise(fd, region_start, region_end - region_start, _FADV_SEQUENTIAL)
 			parts: list[np.ndarray] = []
 			pos = region_start
 			while pos < region_end:
@@ -177,6 +203,9 @@ def tokenize(
 				nl_offsets = np.where(arr == ord('\n'))[0]
 				if len(nl_offsets):
 					parts.append((pos + nl_offsets + 1).astype(np.uint64))
+				# Evict this block from the page cache — we will never read it again.
+				# Prevents cache thrashing when file_size >> RAM.
+				_fadvise(fd, pos, len(block), _FADV_DONTNEED)
 				pos += len(block)
 			return np.concatenate(parts) if parts else np.empty(0, dtype=np.uint64)
 
