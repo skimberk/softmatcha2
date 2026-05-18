@@ -321,7 +321,7 @@ def tokenize(
 			finally:
 				os.close(_est_fd)
 			sub_token = return_number_of_tokens(lines, num_workers, tokenizer)
-			safe_ratio = 1.003 + 0.03 * ((2 ** num_retries) - 1)
+			safe_ratio = 1.3 + 0.05 * ((2 ** num_retries) - 1)
 			est_tokens = int(safe_ratio * total_bytes * sub_token / sub_bytes)
 
 
