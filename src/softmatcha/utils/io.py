@@ -35,12 +35,14 @@ def buffer_lines(
 	total: int = 1000,
 	chunk: int = 1000,
 	jsonl_key: str | None = None,
+	show_bar: bool = True,
 ) -> Generator[list[str], None, None]:
 	bar = CustomTqdm(
 		total=total,
 		bar_format="{bar:64} {n_fmt}/{total_fmt} ETA {remaining}",
 		ascii="░█",
-		dynamic_ncols=True
+		dynamic_ncols=True,
+		disable=not show_bar,
 	)
 
 	# jsonl_key が存在する場合，まだバグっている

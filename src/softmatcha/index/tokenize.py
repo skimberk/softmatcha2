@@ -217,6 +217,8 @@ def tokenize(
 		# run truly in parallel on both I/O and CPU.
 		_BLOCK = 256 * 1024 * 1024  # 256 MB — fewer pread() syscalls than 64 MB
 
+		bar1 = get_custom_tqdm(num_chunk)
+
 		def _scan_region(fd: int, region_start: int, region_end: int) -> np.ndarray:
 			"""Return absolute byte positions of line starts inside [region_start, region_end)."""
 			# Hint: read this region sequentially → aggressive kernel prefetch.
@@ -235,10 +237,10 @@ def tokenize(
 				# Evict this block from the page cache — we will never read it again.
 				# Prevents cache thrashing when file_size >> RAM.
 				_fadvise(fd, pos, len(block), _FADV_DONTNEED)
+				# Update the progress bar as each block is processed (thread-safe).
+				bar1.update(len(block) // chunk)
 				pos += len(block)
 			return np.concatenate(parts) if parts else np.empty(0, dtype=np.uint64)
-
-		bar1 = get_custom_tqdm(num_chunk)
 		num_lines = 0
 
 		# Determine last byte to handle files not ending with '\n'.
@@ -375,41 +377,48 @@ def tokenize(
 		clines = 0
 		ct = 0
 		failed = False
+		# Use a smaller chunksize than buffer_size so results trickle back from
+		# workers throughout the batch rather than all arriving at once at the end.
+		# chunksize=100 means each worker returns results every ~100 lines, giving
+		# frequent bar updates without meaningful IPC overhead.
+		_map_chunksize = max(1, buffer_size // 25)
+		bar2 = get_custom_tqdm(num_lines)
 		with concurrent.futures.ProcessPoolExecutor(
 			max_workers=num_workers,
 			initializer=init_worker,
 			initargs=(tokenizer, tokenizer.cfg)
 		) as executor:
 			with stopwatch.timers["tokenize"]:
-				for buffer in buffer_lines(input_file, buffer_size*num_workers, num_chunk, chunk):
-					results = list(executor.map(tokenize_encode_offsets, buffer, chunksize=buffer_size))
-					token_sequences, offsets_sequences = zip(*results)
+				for buffer in buffer_lines(input_file, buffer_size*num_workers, num_chunk, chunk, show_bar=False):
 					init_ctokens = ctokens
+					token_lengths = []
 
-					# copy the token sequence to tokens[]
-					for seq in token_sequences:
-						length = seq.shape[0]
+					# Iterate over map results one at a time so the bar updates as
+					# each chunk of lines finishes, not only after the entire buffer.
+					for token_seq, offset_seq in executor.map(
+						tokenize_encode_offsets, buffer, chunksize=_map_chunksize
+					):
+						length = token_seq.shape[0]
 						if ctokens + length > TOKEN_SIZE:
 							failed = True
 							break
-						tokens[ctokens : ctokens+length] = seq
+						tokens[ctokens : ctokens+length] = token_seq
+						bytes_rec[ct : ct+length] = offset_seq
 						ctokens += length
-					if failed == True:
-						break
-					
-					# copy the byte offsets to byte_offsets1[]
-					for seq in offsets_sequences:
-						length = seq.shape[0]
-						bytes_rec[ct : ct+length] = seq
 						ct += length
+						token_lengths.append(length)
+						bar2.update(1)
 
-					# copy the line numbers
-					a = np.fromiter((len(seq) for seq in token_sequences), dtype=np.int64)
-					s = np.empty(len(a) + 1, dtype=np.int64)
-					s[0] = 0
-					s[1:] = np.cumsum(a)
-					lines_tkn[clines : clines + len(token_sequences)] = init_ctokens + s[0 : len(token_sequences)]
-					clines += len(token_sequences)
+					if failed:
+						break
+
+					# copy the line-start token indices
+					cum = init_ctokens
+					for k, ln in enumerate(token_lengths):
+						lines_tkn[clines + k] = cum
+						cum += ln
+					clines += len(token_lengths)
+		bar2.close()
 		if failed == True:
 			logger.info(f"Failed to estimate the number of tokens. repeating...")
 			num_retries += 1
