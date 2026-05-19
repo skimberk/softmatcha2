@@ -60,6 +60,23 @@ class Tokenizer(abc.ABC):
 			list[str]: The tokenized line.
 		"""
 
+	def tokenize_raw_with_char_offsets(self, line: str) -> tuple[list[str], list[int]]:
+		"""Tokenize and return (tokens, char_positions_in_original_line).
+
+		Default implementation: calls tokenize_raw then linearly scans for each
+		token's position.  Subclasses that track positions during tokenization
+		(e.g. TokenizerICU) can override this to avoid the second scan.
+		"""
+		tokens = self.tokenize_raw(line)
+		char_positions: list[int] = []
+		char_pos = 0
+		for tok in tokens:
+			found = line.find(tok, char_pos)
+			char_positions.append(found if found >= 0 else 0)
+			if found > 0:
+				char_pos = found + len(tok)
+		return tokens, char_positions
+
 	def get_span_start_positions(self, line: str, tokens: list[str]) -> NDArrayU32:
 		"""Get the start positions of spans.
 

@@ -403,7 +403,7 @@ _COMPARISON_VOCAB = [
     "single", "word1", "word2", "中文", "🎉",
 ]
 
-@pytest.mark.parametrize("line", [
+_COMPARISON_LINES = [
     "",
     "   ",
     "hello",
@@ -420,17 +420,108 @@ _COMPARISON_VOCAB = [
     "UPPERCASE TEXT",
     "a b c d e f g",
     "word1 unknown_word word2",
-])
+]
+
+@pytest.mark.parametrize("line", _COMPARISON_LINES)
 def test_comparison_with_reference(line):
     """tokenize_encode_offsets must produce byte-for-byte identical output to
-    the reference implementation across a range of inputs.
-
-    To verify a future optimised replacement:
-    1. Import / call it here as `new_ids, new_offsets = new_function(line)`.
-    2. Assert equality against `ref_ids` / `ref_offsets`.
-    """
+    the reference implementation across a range of inputs."""
     tok = set_tokenizer(_COMPARISON_VOCAB)
     ref_ids, ref_offsets = tokenize_encode_offsets_reference(line, tok)
     actual_ids, actual_offsets = tokenize_encode_offsets(line)
     np.testing.assert_array_equal(actual_ids, ref_ids)
     np.testing.assert_array_equal(actual_offsets, ref_offsets)
+
+
+# ---------------------------------------------------------------------------
+# Rust fast-path tests using the real ICU tokenizer
+# The Rust path (encode_and_offsets_rs) is active when:
+#   - softmatcha_rs is importable (Rust extension built with maturin)
+#   - the tokenizer exposes get_span_bounds()  (TokenizerICU does)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def icu_tok_with_rust_vocab():
+    """Build a real TokenizerICU + matching _worker_rust_vocab for Rust-path tests."""
+    import json, tempfile, os
+    vocab_words = [
+        "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
+        "hello", "world", "café", "bar", "a", "be", "in", "on", "at",
+        "中文", "test", "leading", "spaces",
+    ]
+    d = {w: i for i, w in enumerate(vocab_words)}
+    d["<unk>"] = len(vocab_words)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "vocab.json"), "w") as f:
+            json.dump(d, f)
+
+        from softmatcha.tokenizers.icu import TokenizerICU
+        tok = TokenizerICU.build(TokenizerICU.Config(name_or_path=tmpdir, lang="en"))
+
+        try:
+            from softmatcha_rs import build_rust_vocab
+            rust_vocab = build_rust_vocab(list(tok.dictionary.items()), tok.unk_idx)
+        except ImportError:
+            pytest.skip("softmatcha_rs not built; skipping Rust-path tests")
+
+        yield tok, rust_vocab
+
+
+@pytest.mark.parametrize("line", [
+    "",
+    "   ",
+    "hello",
+    "hello world",
+    "Hello World",
+    "the quick brown fox jumps over the lazy dog",
+    "café bar",
+    "hello 中文 world",
+    "  leading spaces",
+    "test test test",          # repeated tokens — ICU gives correct offsets
+    "The the fox",             # mixed case
+])
+def test_rust_path_matches_icu_python_path(line, icu_tok_with_rust_vocab):
+    """The Rust fast path must agree with the Python ICU path on all inputs.
+
+    Both paths use ICU break-iterator positions, so they should give identical
+    results.  Note: for repeated tokens like 'the the the', the Rust+ICU path
+    correctly gives distinct offsets (e.g. [0,4,8]), unlike the old Python
+    reference which had the position-0 quirk ([0,0,0]).
+    """
+    tok, rust_vocab = icu_tok_with_rust_vocab
+
+    # Python ICU path
+    symbols, char_positions = tok.tokenize_raw_with_char_offsets(line)
+    n = len(symbols)
+    if n == 0:
+        py_ids = np.empty(0, dtype=np.uint32)
+        py_offs = np.empty(0, dtype=np.uint32)
+    else:
+        d = tok.dictionary; unk = tok.unk_idx
+        py_ids = np.empty(n, dtype=np.uint32)
+        py_offs = np.empty(n, dtype=np.uint32)
+        if line.isascii():
+            for i, (sym, cp) in enumerate(zip(symbols, char_positions)):
+                py_ids[i] = d.get(sym.lower(), unk)
+                py_offs[i] = cp
+        else:
+            line_bytes_np = np.frombuffer(line.encode("utf-8"), dtype=np.uint8)
+            char_byte = np.where((line_bytes_np < 0x80) | (line_bytes_np >= 0xC0))[0]
+            for i, (sym, cp) in enumerate(zip(symbols, char_positions)):
+                py_ids[i] = d.get(sym.lower(), unk)
+                py_offs[i] = int(char_byte[cp]) if cp < len(char_byte) else 0
+
+    # Rust path
+    from softmatcha_rs import encode_and_offsets_rs
+    starts_np, ends_np = tok.get_span_bounds(line)
+    if len(starts_np) == 0:
+        rust_ids = np.empty(0, dtype=np.uint32)
+        rust_offs = np.empty(0, dtype=np.uint32)
+    else:
+        rust_ids, rust_offs = encode_and_offsets_rs(line, starts_np, ends_np, rust_vocab)
+
+    np.testing.assert_array_equal(rust_ids, py_ids)
+    np.testing.assert_array_equal(rust_offs, py_offs)
+
+

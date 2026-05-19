@@ -14,15 +14,25 @@ from softmatcha.utils.makefile import make_file
 from softmatcha.utils.custom_tqdm import CustomTqdm
 logger = logging.getLogger(__name__)
 _worker_tokenizer = None
+_worker_rust_vocab = None  # RustVocab built once per worker; None if softmatcha_rs unavailable
 
 
 # =====================================================================================================================
 # Preparation
 # =====================================================================================================================
 def init_worker(tokenizer: Tokenizer, cfg):
-	global _worker_tokenizer
+	global _worker_tokenizer, _worker_rust_vocab
 	_worker_tokenizer = tokenizer
 	tokenizer.build(cfg)
+	# Build a Rust-native vocab table for the fast encode+offset path.
+	try:
+		from softmatcha_rs import build_rust_vocab
+		_worker_rust_vocab = build_rust_vocab(
+			list(tokenizer.dictionary.items()),
+			tokenizer.unk_idx,
+		)
+	except Exception:
+		_worker_rust_vocab = None
 
 def tokenize_count(line: str):
 	global _worker_tokenizer
@@ -30,14 +40,62 @@ def tokenize_count(line: str):
 	return len(symbols)
 
 def tokenize_encode_offsets(line: str):
-	global _worker_tokenizer
-	symbols = _worker_tokenizer.tokenize_raw(line)
-	token_ids = _worker_tokenizer.encode([sym.lower() for sym in symbols])
-	offsets = _worker_tokenizer.get_span_start_positions(
-		line,
-		symbols,
-	)
-	return token_ids, offsets
+	"""Tokenize a line and return (token_ids, byte_offsets).
+
+	Fast path (ICU + Rust): if the tokenizer exposes get_span_bounds() and a
+	Rust vocab is available, delegates the encode+offset computation entirely to
+	Rust via encode_and_offsets_rs.  This avoids per-token Python overhead for
+	both the dictionary lookup and the char→byte conversion.
+
+	Fallback (Python): uses tokenize_raw_with_char_offsets + a Python loop.
+	ASCII lines take the char==byte shortcut; non-ASCII lines build a
+	char→byte map via numpy over the encoded bytes.
+	"""
+	global _worker_tokenizer, _worker_rust_vocab
+	tok = _worker_tokenizer
+
+	if _worker_rust_vocab is not None and hasattr(tok, "get_span_bounds"):
+		# ------------------------------------------------------------------
+		# Rust fast path
+		# ------------------------------------------------------------------
+		from softmatcha_rs import encode_and_offsets_rs
+		span_starts, span_ends = tok.get_span_bounds(line)
+		if len(span_starts) == 0:
+			empty = np.empty(0, dtype=np.uint32)
+			return empty, empty
+		return encode_and_offsets_rs(line, span_starts, span_ends, _worker_rust_vocab)
+
+	# ------------------------------------------------------------------
+	# Python fallback path
+	# ------------------------------------------------------------------
+	symbols, char_positions = tok.tokenize_raw_with_char_offsets(line)
+
+	n = len(symbols)
+	if n == 0:
+		empty = np.empty(0, dtype=np.uint32)
+		return empty, empty
+
+	d = tok.dictionary
+	unk = tok.unk_idx
+	token_ids = np.empty(n, dtype=np.uint32)
+	span_starts = np.empty(n, dtype=np.uint32)
+
+	if line.isascii():
+		# For ASCII: byte offset == char offset.
+		for i, (sym, cp) in enumerate(zip(symbols, char_positions)):
+			token_ids[i] = d.get(sym.lower(), unk)
+			span_starts[i] = cp
+	else:
+		# For non-ASCII: vectorised char→byte mapping via the encoded bytes.
+		# Continuation bytes (0x80–0xBF) belong to multi-byte sequences; only
+		# the leading byte of each character is counted as a new char start.
+		line_bytes_np = np.frombuffer(line.encode("utf-8"), dtype=np.uint8)
+		char_byte = np.where((line_bytes_np < 0x80) | (line_bytes_np >= 0xC0))[0]
+		for i, (sym, cp) in enumerate(zip(symbols, char_positions)):
+			token_ids[i] = d.get(sym.lower(), unk)
+			span_starts[i] = int(char_byte[cp]) if cp < len(char_byte) else 0
+
+	return token_ids, span_starts
 
 def get_custom_tqdm(num):
 	return CustomTqdm(
