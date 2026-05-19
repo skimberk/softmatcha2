@@ -8,7 +8,7 @@ use std::sync::Once;
 use crate::index::main::build_sa_rs;
 use crate::search::main::enumerate_candidates_rs;
 use crate::search::main::get_match_range_rs;
-use crate::tokenize::{RustVocab, build_rust_vocab, encode_and_offsets_rs, tokenize_and_encode_rs};
+use crate::tokenize::{RustVocab, build_rust_vocab, encode_and_offsets_rs, tokenize_and_encode_rs, tokenize_batch_rs};
 static INIT_LOGGER: Once = Once::new();
 
 
@@ -35,6 +35,7 @@ fn softmatcha_rs(m: &Bound<PyModule>) -> PyResult<()> {
 	m.add_function(wrap_pyfunction!(build_rust_vocab, m)?)?;
 	m.add_function(wrap_pyfunction!(encode_and_offsets_rs, m)?)?;
 	m.add_function(wrap_pyfunction!(tokenize_and_encode_rs, m)?)?;
+	m.add_function(wrap_pyfunction!(tokenize_batch_rs, m)?)?;
 	m.add_class::<RustVocab>()?;
 	Ok(())
 }

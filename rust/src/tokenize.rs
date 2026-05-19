@@ -136,7 +136,7 @@ pub fn encode_and_offsets_rs<'py>(
     ))
 }
 
-/// Full tokenise-and-encode using icu4x word segmentation.
+/// Tokenise a single line using icu4x word segmentation and encode with vocab.
 ///
 /// Replaces the Python ICU path entirely: strips the line, runs the icu4x
 /// WordSegmenter (same Unicode word-break rules as PyICU), looks up lowercase
@@ -150,9 +150,7 @@ pub fn tokenize_and_encode_rs<'py>(
     line: &str,
     vocab: &RustVocab,
 ) -> PyResult<(Bound<'py, PyArray1<u32>>, Bound<'py, PyArray1<u32>>)> {
-    // Strip leading/trailing whitespace, matching Python's str.strip().
     let trimmed = line.trim();
-    // Byte offset of `trimmed` within `line` (for restoring original positions).
     let leading_bytes = line.len() - line.trim_start().len();
 
     let (token_ids, byte_offsets) = WORD_SEGMENTER.with(|seg| {
@@ -164,20 +162,15 @@ pub fn tokenize_and_encode_rs<'py>(
         }
 
         let mut iter = seg.segment_str(trimmed);
-        let mut prev = 0usize; // byte position of the start of the current span
+        let mut prev = 0usize;
 
         while let Some(boundary) = iter.next() {
             let span = &trimmed[prev..boundary];
-            // Match apply_break_iterator: include every non-whitespace span
-            // (words AND punctuation), drop pure-whitespace spans.
             let token = span.trim();
             if !token.is_empty() {
-                // ICU word-break spans never mix content and surrounding whitespace,
-                // so span.trim() == span for non-WS spans and the token starts at prev.
                 let leading_in_span = span.len() - span.trim_start().len();
                 byte_offsets.push((leading_bytes + prev + leading_in_span) as u32);
 
-                // Lowercase lookup, avoiding heap allocation for common case.
                 let id = if token.is_ascii() {
                     if token.bytes().any(|b| b.is_ascii_uppercase()) {
                         let lower = token.to_ascii_lowercase();
@@ -204,5 +197,85 @@ pub fn tokenize_and_encode_rs<'py>(
     Ok((
         PyArray1::from_vec(py, token_ids),
         PyArray1::from_vec(py, byte_offsets),
+    ))
+}
+
+/// Batch version of tokenize_and_encode_rs.
+///
+/// Processes a list of lines in a single Rust call, returning three arrays:
+///   - cat_token_ids:   all token IDs concatenated across lines
+///   - cat_byte_offsets: all byte offsets concatenated across lines
+///   - lengths:         number of tokens produced per input line
+///
+/// Using a batch call instead of one call per line avoids:
+///   - the Python→Rust boundary crossing overhead per line
+///   - per-line numpy array allocation (2 arrays per line → 3 total)
+///   - the thread-local WORD_SEGMENTER lookup overhead per line
+///
+/// The WORD_SEGMENTER TLS variable is accessed exactly once for the entire
+/// batch; all lines are processed inside a single `with()` closure.
+#[pyfunction]
+pub fn tokenize_batch_rs<'py>(
+    py: Python<'py>,
+    lines: Vec<String>,
+    vocab: &RustVocab,
+) -> PyResult<(
+    Bound<'py, PyArray1<u32>>,
+    Bound<'py, PyArray1<u32>>,
+    Bound<'py, PyArray1<u32>>,
+)> {
+    let n = lines.len();
+    let (all_token_ids, all_byte_offsets, lengths) = WORD_SEGMENTER.with(|seg| {
+        let mut token_ids: Vec<u32> = Vec::with_capacity(n * 8);
+        let mut byte_offsets: Vec<u32> = Vec::with_capacity(n * 8);
+        let mut lengths: Vec<u32> = Vec::with_capacity(n);
+
+        for line in &lines {
+            let trimmed = line.trim();
+            let leading_bytes = line.len() - line.trim_start().len();
+            let start_count = token_ids.len();
+
+            if !trimmed.is_empty() {
+                let mut iter = seg.segment_str(trimmed);
+                let mut prev = 0usize;
+
+                while let Some(boundary) = iter.next() {
+                    let span = &trimmed[prev..boundary];
+                    let token = span.trim();
+                    if !token.is_empty() {
+                        let leading_in_span = span.len() - span.trim_start().len();
+                        byte_offsets.push((leading_bytes + prev + leading_in_span) as u32);
+
+                        let id = if token.is_ascii() {
+                            if token.bytes().any(|b| b.is_ascii_uppercase()) {
+                                let lower = token.to_ascii_lowercase();
+                                vocab.map.get(&lower)
+                            } else {
+                                vocab.map.get(token)
+                            }
+                        } else {
+                            if token.chars().any(|c| c.is_uppercase()) {
+                                let lower = token.to_lowercase();
+                                vocab.map.get(&lower)
+                            } else {
+                                vocab.map.get(token)
+                            }
+                        };
+                        token_ids.push(*id.unwrap_or(&vocab.unk_idx));
+                    }
+                    prev = boundary;
+                }
+            }
+
+            lengths.push((token_ids.len() - start_count) as u32);
+        }
+
+        (token_ids, byte_offsets, lengths)
+    });
+
+    Ok((
+        PyArray1::from_vec(py, all_token_ids),
+        PyArray1::from_vec(py, all_byte_offsets),
+        PyArray1::from_vec(py, lengths),
     ))
 }

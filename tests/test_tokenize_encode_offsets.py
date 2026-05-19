@@ -73,23 +73,29 @@ def make_test_tokenizer(vocab: list[str]) -> SimpleTestTokenizer:
 @pytest.fixture(autouse=True)
 def restore_worker_tokenizer():
     """Restore all worker globals after every test."""
-    orig_tok       = tokenize_module._worker_tokenizer
-    orig_vocab     = tokenize_module._worker_rust_vocab
-    orig_use_icu4x = tokenize_module._worker_use_icu4x
+    orig_tok        = tokenize_module._worker_tokenizer
+    orig_vocab      = tokenize_module._worker_rust_vocab
+    orig_use_icu4x  = tokenize_module._worker_use_icu4x
+    orig_tok_fn     = tokenize_module._worker_tokenize_fn
+    orig_batch_fn   = tokenize_module._worker_tokenize_batch_fn
     yield
-    tokenize_module._worker_tokenizer  = orig_tok
-    tokenize_module._worker_rust_vocab = orig_vocab
-    tokenize_module._worker_use_icu4x  = orig_use_icu4x
+    tokenize_module._worker_tokenizer        = orig_tok
+    tokenize_module._worker_rust_vocab       = orig_vocab
+    tokenize_module._worker_use_icu4x        = orig_use_icu4x
+    tokenize_module._worker_tokenize_fn      = orig_tok_fn
+    tokenize_module._worker_tokenize_batch_fn = orig_batch_fn
 
 
 def set_tokenizer(vocab: list[str]) -> SimpleTestTokenizer:
     """Create and install a test tokenizer; return it for further inspection."""
     tok = make_test_tokenizer(vocab)
-    tokenize_module._worker_tokenizer = tok
+    tokenize_module._worker_tokenizer        = tok
     # The mock tokenizer is not ICU-based; force the Python fallback path so
     # that tests are not contaminated by icu4x globals left by other test files.
-    tokenize_module._worker_use_icu4x = False
-    tokenize_module._worker_rust_vocab = None
+    tokenize_module._worker_use_icu4x        = False
+    tokenize_module._worker_rust_vocab       = None
+    tokenize_module._worker_tokenize_fn      = None
+    tokenize_module._worker_tokenize_batch_fn = None
     return tok
 
 
@@ -531,5 +537,150 @@ def test_rust_path_matches_icu_python_path(line, icu_tok_with_rust_vocab):
 
     np.testing.assert_array_equal(rust_ids, py_ids)
     np.testing.assert_array_equal(rust_offs, py_offs)
+
+
+# ---------------------------------------------------------------------------
+# Batch function tests (_tokenize_encode_offsets_batch / tokenize_batch_rs)
+# ---------------------------------------------------------------------------
+
+_BATCH_TEST_LINES = [
+    "",
+    "   ",
+    "hello",
+    "hello world",
+    "Hello World",
+    "the quick brown fox jumps over the lazy dog",
+    "café bar",
+    "hello 中文 world",
+    "  leading spaces",
+    "trailing spaces  ",
+    "UPPERCASE TEXT",
+    "word1 unknown_word word2",
+]
+
+
+@pytest.fixture(scope="module")
+def icu_tok_batch():
+    """Real ICU tokenizer + RustVocab for batch-function tests."""
+    import json, tempfile, os
+    vocab_words = [
+        "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
+        "hello", "world", "café", "bar", "a", "be", "in", "on", "at",
+        "中文", "test", "leading", "spaces",
+    ]
+    d = {w: i for i, w in enumerate(vocab_words)}
+    d["<unk>"] = len(vocab_words)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "vocab.json"), "w") as f:
+            json.dump(d, f)
+        from softmatcha.tokenizers.icu import TokenizerICU
+        tok = TokenizerICU.build(TokenizerICU.Config(name_or_path=tmpdir, lang="en"))
+
+    try:
+        from softmatcha_rs import build_rust_vocab, tokenize_batch_rs  # noqa: F401
+        rust_vocab = build_rust_vocab(list(tok.dictionary.items()), tok.unk_idx)
+    except ImportError:
+        pytest.skip("softmatcha_rs not built; skipping batch tests")
+
+    yield tok, rust_vocab
+
+
+def test_tokenize_batch_rs_matches_individual(icu_tok_batch):
+    """tokenize_batch_rs must produce results identical to individual calls."""
+    from softmatcha_rs import tokenize_and_encode_rs, tokenize_batch_rs
+    tok, rust_vocab = icu_tok_batch
+
+    batch_tok, batch_off, batch_len = tokenize_batch_rs(_BATCH_TEST_LINES, rust_vocab)
+
+    offset = 0
+    for i, line in enumerate(_BATCH_TEST_LINES):
+        ind_tok, ind_off = tokenize_and_encode_rs(line, rust_vocab)
+        n = len(ind_tok)
+        assert int(batch_len[i]) == n, f"Length mismatch at line {i}: {line!r}"
+        np.testing.assert_array_equal(
+            batch_tok[offset : offset + n], ind_tok,
+            err_msg=f"token_ids mismatch at line {i}: {line!r}"
+        )
+        np.testing.assert_array_equal(
+            batch_off[offset : offset + n], ind_off,
+            err_msg=f"byte_offsets mismatch at line {i}: {line!r}"
+        )
+        offset += n
+
+
+def test_tokenize_batch_rs_empty_batch(icu_tok_batch):
+    """tokenize_batch_rs on an empty list returns three empty arrays."""
+    from softmatcha_rs import tokenize_batch_rs
+    _, rust_vocab = icu_tok_batch
+    tok_ids, offsets, lengths = tokenize_batch_rs([], rust_vocab)
+    assert len(tok_ids) == 0
+    assert len(offsets) == 0
+    assert len(lengths) == 0
+
+
+def test_tokenize_batch_rs_all_empty_lines(icu_tok_batch):
+    """tokenize_batch_rs on all-empty lines: all token counts are zero."""
+    from softmatcha_rs import tokenize_batch_rs
+    _, rust_vocab = icu_tok_batch
+    lines = ["", "   ", "\t", "  \n"]
+    tok_ids, offsets, lengths = tokenize_batch_rs(lines, rust_vocab)
+    assert len(tok_ids) == 0
+    assert len(offsets) == 0
+    assert len(lengths) == 4
+    assert all(int(l) == 0 for l in lengths)
+
+
+def test_batch_worker_fn_python_fallback():
+    """_tokenize_encode_offsets_batch fallback path (non-icu4x) returns correct results."""
+    vocab = ["hello", "world", "the", "quick", "fox"]
+    tok = set_tokenizer(vocab)  # sets _worker_use_icu4x=False, _worker_tokenize_batch_fn=None
+
+    lines = ["hello world", "the quick fox", ""]
+    cat_tok, cat_off, lengths = tokenize_module._tokenize_encode_offsets_batch(lines)
+
+    assert cat_tok.dtype == np.uint32
+    assert cat_off.dtype == np.uint32
+    assert lengths.dtype == np.uint32
+    assert int(lengths[2]) == 0  # empty line has 0 tokens
+    assert len(cat_tok) == int(lengths[0]) + int(lengths[1]) + int(lengths[2])
+
+    # Verify individual results match
+    offset = 0
+    for i, line in enumerate(lines):
+        n = int(lengths[i])
+        ind_tok, ind_off = tokenize_encode_offsets(line)
+        np.testing.assert_array_equal(cat_tok[offset:offset+n], ind_tok)
+        np.testing.assert_array_equal(cat_off[offset:offset+n], ind_off)
+        offset += n
+
+
+def test_batch_worker_fn_icu4x_path(icu_tok_batch):
+    """_tokenize_encode_offsets_batch fast path (icu4x) returns correct results."""
+    from softmatcha_rs import tokenize_batch_rs
+    tok, rust_vocab = icu_tok_batch
+
+    # Install icu4x globals
+    tokenize_module._worker_tokenizer        = tok
+    tokenize_module._worker_rust_vocab       = rust_vocab
+    tokenize_module._worker_use_icu4x        = True
+    tokenize_module._worker_tokenize_fn      = __import__('softmatcha_rs').tokenize_and_encode_rs
+    tokenize_module._worker_tokenize_batch_fn = tokenize_batch_rs
+
+    lines = _BATCH_TEST_LINES
+    cat_tok, cat_off, lengths = tokenize_module._tokenize_encode_offsets_batch(lines)
+
+    assert len(lengths) == len(lines)
+    assert sum(int(l) for l in lengths) == len(cat_tok) == len(cat_off)
+
+    # Each offset must be a valid byte position in its line
+    offset = 0
+    for i, line in enumerate(lines):
+        n = int(lengths[i])
+        line_bytes = line.encode("utf-8")
+        for off in cat_off[offset:offset+n]:
+            assert 0 <= int(off) < max(1, len(line_bytes)), \
+                f"Offset {int(off)} out of range for line {line!r}"
+        offset += n
 
 

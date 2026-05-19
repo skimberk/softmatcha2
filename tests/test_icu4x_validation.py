@@ -86,12 +86,18 @@ def setup() -> TokenizerSetup:
             json.dump(d, f)
         tok = TokenizerICU.build(TokenizerICU.Config(name_or_path=tmpdir, lang="en"))
 
-    from softmatcha_rs import build_rust_vocab
+    from softmatcha_rs import build_rust_vocab, tokenize_and_encode_rs
     rv = build_rust_vocab(list(tok.dictionary.items()), tok.unk_idx)
     # Install as the active worker tokenizer so tokenize_encode_offsets uses it
-    tokenize_module._worker_tokenizer = tok
-    tokenize_module._worker_rust_vocab = rv
-    tokenize_module._worker_use_icu4x = True
+    tokenize_module._worker_tokenizer        = tok
+    tokenize_module._worker_rust_vocab       = rv
+    tokenize_module._worker_use_icu4x        = True
+    tokenize_module._worker_tokenize_fn      = tokenize_and_encode_rs
+    try:
+        from softmatcha_rs import tokenize_batch_rs
+        tokenize_module._worker_tokenize_batch_fn = tokenize_batch_rs
+    except ImportError:
+        tokenize_module._worker_tokenize_batch_fn = None
     return TokenizerSetup(tok=tok, rust_vocab=rv)
 
 
@@ -558,6 +564,7 @@ def test_tokenize_encode_offsets_uses_icu4x(setup):
     """tokenize_encode_offsets must be using the icu4x path when _worker_use_icu4x=True."""
     assert tokenize_module._worker_use_icu4x, "icu4x path not active"
     assert tokenize_module._worker_rust_vocab is not None
+    assert tokenize_module._worker_tokenize_fn is not None, "_worker_tokenize_fn must be set"
 
     line = "the quick brown fox jumps over the lazy dog"
     ids, offs = tokenize_module.tokenize_encode_offsets(line)
@@ -568,3 +575,64 @@ def test_tokenize_encode_offsets_uses_icu4x(setup):
     line_bytes = line.encode()
     for sym, off in zip(ref_sym, offs):
         assert line_bytes[int(off) : int(off) + len(sym)] == sym.encode()
+
+
+# ---------------------------------------------------------------------------
+# tokenize_batch_rs regression
+# ---------------------------------------------------------------------------
+
+def test_tokenize_batch_rs_matches_individual_calls(setup):
+    """tokenize_batch_rs must produce results identical to per-line tokenize_and_encode_rs."""
+    try:
+        from softmatcha_rs import tokenize_batch_rs
+    except ImportError:
+        pytest.skip("tokenize_batch_rs not available")
+
+    import numpy as np
+    lines = REGRESSION_SENTENCES + [
+        "café bar",
+        "hello 中文 world",
+        "naïve über café",
+    ]
+    batch_tok, batch_off, batch_len = tokenize_batch_rs(lines, setup.rust_vocab)
+    assert len(batch_len) == len(lines)
+    assert len(batch_tok) == sum(int(l) for l in batch_len)
+    assert len(batch_off) == len(batch_tok)
+
+    offset = 0
+    for i, line in enumerate(lines):
+        ind_tok, ind_off = icu4x_result(line, setup.rust_vocab)
+        n = len(ind_tok)
+        assert int(batch_len[i]) == n, f"Length mismatch at line {i}: {line!r}"
+        np.testing.assert_array_equal(
+            batch_tok[offset:offset+n], ind_tok,
+            err_msg=f"token_ids differ at line {i}: {line!r}"
+        )
+        np.testing.assert_array_equal(
+            batch_off[offset:offset+n], ind_off,
+            err_msg=f"byte_offsets differ at line {i}: {line!r}"
+        )
+        offset += n
+
+
+def test_batch_worker_fn_uses_icu4x_path(setup):
+    """_tokenize_encode_offsets_batch must use tokenize_batch_rs when available."""
+    if tokenize_module._worker_tokenize_batch_fn is None:
+        pytest.skip("tokenize_batch_rs not available")
+
+    import numpy as np
+    lines = ["the quick brown fox", "Hello World!", "café bar", ""]
+    cat_tok, cat_off, lengths = tokenize_module._tokenize_encode_offsets_batch(lines)
+
+    assert len(lengths) == len(lines)
+    total = sum(int(l) for l in lengths)
+    assert len(cat_tok) == total
+    assert len(cat_off) == total
+
+    offset = 0
+    for i, line in enumerate(lines):
+        n = int(lengths[i])
+        ind_tok, ind_off = icu4x_result(line, setup.rust_vocab)
+        np.testing.assert_array_equal(cat_tok[offset:offset+n], ind_tok)
+        np.testing.assert_array_equal(cat_off[offset:offset+n], ind_off)
+        offset += n

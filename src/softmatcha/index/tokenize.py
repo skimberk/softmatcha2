@@ -14,8 +14,10 @@ from softmatcha.utils.makefile import make_file
 from softmatcha.utils.custom_tqdm import CustomTqdm
 logger = logging.getLogger(__name__)
 _worker_tokenizer = None
-_worker_rust_vocab = None   # RustVocab built once per worker; None if softmatcha_rs unavailable
-_worker_use_icu4x = False   # True when tokenize_and_encode_rs (icu4x) is the active path
+_worker_rust_vocab = None        # RustVocab built once per worker; None if softmatcha_rs unavailable
+_worker_use_icu4x = False        # True when tokenize_and_encode_rs (icu4x) is the active path
+_worker_tokenize_fn = None       # Cached reference to tokenize_and_encode_rs (avoids per-call import)
+_worker_tokenize_batch_fn = None # Cached reference to tokenize_batch_rs; None if unavailable
 
 
 # =====================================================================================================================
@@ -23,12 +25,15 @@ _worker_use_icu4x = False   # True when tokenize_and_encode_rs (icu4x) is the ac
 # =====================================================================================================================
 def init_worker(tokenizer: Tokenizer, cfg):
 	global _worker_tokenizer, _worker_rust_vocab, _worker_use_icu4x
+	global _worker_tokenize_fn, _worker_tokenize_batch_fn
 	_worker_tokenizer = tokenizer
 	tokenizer.build(cfg)
 	_worker_use_icu4x = False
 	_worker_rust_vocab = None
+	_worker_tokenize_fn = None
+	_worker_tokenize_batch_fn = None
 	try:
-		from softmatcha_rs import build_rust_vocab, tokenize_and_encode_rs  # noqa: F401
+		from softmatcha_rs import build_rust_vocab, tokenize_and_encode_rs
 		_worker_rust_vocab = build_rust_vocab(
 			list(tokenizer.dictionary.items()),
 			tokenizer.unk_idx,
@@ -36,6 +41,12 @@ def init_worker(tokenizer: Tokenizer, cfg):
 		# icu4x path: only for ICU-based tokenizers (exposes get_span_bounds)
 		if hasattr(tokenizer, "get_span_bounds"):
 			_worker_use_icu4x = True
+			_worker_tokenize_fn = tokenize_and_encode_rs
+			try:
+				from softmatcha_rs import tokenize_batch_rs
+				_worker_tokenize_batch_fn = tokenize_batch_rs
+			except ImportError:
+				pass
 	except Exception:
 		pass
 
@@ -54,15 +65,15 @@ def tokenize_encode_offsets(line: str):
 	2. Python ICU + Rust encode: get_span_bounds (Python ICU) then encode_and_offsets_rs.
 	3. Python fallback: tokenize_raw_with_char_offsets + Python encode loop.
 	"""
-	global _worker_tokenizer, _worker_rust_vocab, _worker_use_icu4x
+	global _worker_tokenizer, _worker_rust_vocab, _worker_use_icu4x, _worker_tokenize_fn
 	tok = _worker_tokenizer
 
 	if _worker_use_icu4x:
 		# ------------------------------------------------------------------
-		# icu4x Rust path — entire segmentation + encode runs in Rust
+		# icu4x Rust path — entire segmentation + encode runs in Rust.
+		# _worker_tokenize_fn is set alongside _worker_use_icu4x in init_worker.
 		# ------------------------------------------------------------------
-		from softmatcha_rs import tokenize_and_encode_rs
-		return tokenize_and_encode_rs(line, _worker_rust_vocab)
+		return _worker_tokenize_fn(line, _worker_rust_vocab)
 
 	if _worker_rust_vocab is not None and hasattr(tok, "get_span_bounds"):
 		# ------------------------------------------------------------------
@@ -106,6 +117,35 @@ def tokenize_encode_offsets(line: str):
 			span_starts[i] = int(char_byte[cp]) if cp < len(char_byte) else 0
 
 	return token_ids, span_starts
+
+def _tokenize_encode_offsets_batch(lines_chunk: list[str]):
+	"""Process a chunk of lines and return (cat_token_ids, cat_byte_offsets, lengths).
+
+	Returns three concatenated arrays rather than one (array, array) tuple per
+	line.  This reduces IPC pickling cost when used with ProcessPoolExecutor:
+	unpickling 3 arrays is O(1) in object count vs O(N) for N per-line tuples.
+
+	Fast path (icu4x): delegates to tokenize_batch_rs, which processes all
+	lines in a single Rust call with a single WORD_SEGMENTER TLS access.
+
+	Fallback: calls tokenize_encode_offsets per line and concatenates results.
+	"""
+	global _worker_use_icu4x, _worker_tokenize_batch_fn, _worker_rust_vocab
+	if _worker_use_icu4x and _worker_tokenize_batch_fn is not None:
+		return _worker_tokenize_batch_fn(lines_chunk, _worker_rust_vocab)
+
+	# Fallback: per-line processing
+	results = [tokenize_encode_offsets(line) for line in lines_chunk]
+	if not results:
+		empty = np.empty(0, dtype=np.uint32)
+		return empty, empty, np.empty(0, dtype=np.uint32)
+	tok_seqs, off_seqs = zip(*results)
+	return (
+		np.concatenate(tok_seqs),
+		np.concatenate(off_seqs),
+		np.array([len(s) for s in tok_seqs], dtype=np.uint32),
+	)
+
 
 def get_custom_tqdm(num):
 	return CustomTqdm(
@@ -297,34 +337,38 @@ def tokenize(
 		) as executor:
 			with stopwatch.timers["tokenize"]:
 				for buffer in buffer_lines(input_file, buffer_size*num_workers, num_chunk, chunk):
-					results = list(executor.map(tokenize_encode_offsets, buffer, chunksize=buffer_size))
-					token_sequences, offsets_sequences = zip(*results)
+					# Split buffer into per-worker chunks and submit all at once.
+					# Each worker returns (cat_tok, cat_off, lengths) — 3 arrays
+					# instead of one (arr, arr) tuple per line.  This cuts IPC
+					# unpickling cost from O(N) numpy objects to O(1).
+					chunks = [buffer[i:i+buffer_size] for i in range(0, len(buffer), buffer_size)]
+					futures = [executor.submit(_tokenize_encode_offsets_batch, c) for c in chunks]
+					batch_results = [f.result() for f in futures]
+
+					# Assemble results from all workers into single arrays.
+					all_tok = np.concatenate([r[0] for r in batch_results])
+					all_off = np.concatenate([r[1] for r in batch_results])
+					all_len = np.concatenate([r[2] for r in batch_results]).astype(np.int64)
+
+					n_tokens = len(all_tok)
+					n_lines_buf = len(all_len)
 					init_ctokens = ctokens
 
-					# copy the token sequence to tokens[]
-					for seq in token_sequences:
-						length = seq.shape[0]
-						if ctokens + length > TOKEN_SIZE:
-							failed = True
-							break
-						tokens[ctokens : ctokens+length] = seq
-						ctokens += length
-					if failed == True:
+					if ctokens + n_tokens > TOKEN_SIZE:
+						failed = True
 						break
-					
-					# copy the byte offsets to byte_offsets1[]
-					for seq in offsets_sequences:
-						length = seq.shape[0]
-						bytes_rec[ct : ct+length] = seq
-						ct += length
 
-					# copy the line numbers
-					a = np.fromiter((len(seq) for seq in token_sequences), dtype=np.int64)
-					s = np.empty(len(a) + 1, dtype=np.int64)
-					s[0] = 0
-					s[1:] = np.cumsum(a)
-					lines_tkn[clines : clines + len(token_sequences)] = init_ctokens + s[0 : len(token_sequences)]
-					clines += len(token_sequences)
+					tokens[ctokens : ctokens + n_tokens] = all_tok
+					bytes_rec[ct : ct + n_tokens] = all_off
+					ctokens += n_tokens
+					ct += n_tokens
+
+					# Update per-line token start positions.
+					cumlen = np.empty(n_lines_buf + 1, dtype=np.int64)
+					cumlen[0] = 0
+					cumlen[1:] = np.cumsum(all_len)
+					lines_tkn[clines : clines + n_lines_buf] = init_ctokens + cumlen[:n_lines_buf]
+					clines += n_lines_buf
 		if failed == True:
 			logger.info(f"Failed to estimate the number of tokens. repeating...")
 			num_retries += 1
