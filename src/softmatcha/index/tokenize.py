@@ -376,7 +376,7 @@ def tokenize(
 					cur = lines_byt[current_line] + rec_i32[j]
 					if j != i:
 						byte_offset1[j] = min(255, cur - prv)
-						if cur - prv >= 255 and black_cnt[worker_id] < len(black_list[worker_id]):
+						if cur - prv >= 255 and black_cnt[worker_id] < len(black_list[worker_id]) // 2:
 							black_list[worker_id][2 * black_cnt[worker_id] + 0] = j - 1
 							black_list[worker_id][2 * black_cnt[worker_id] + 1] = cur - prv
 							black_cnt[worker_id] += 1
