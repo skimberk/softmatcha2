@@ -20,3 +20,4 @@ chrono = "0.4"
 libc = "0.2"
 indicatif = "0.18"
 memmap2 = "0.9"
+icu_segmenter = { version = "2.2", features = ["compiled_data"] }

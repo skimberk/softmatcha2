@@ -72,16 +72,24 @@ def make_test_tokenizer(vocab: list[str]) -> SimpleTestTokenizer:
 
 @pytest.fixture(autouse=True)
 def restore_worker_tokenizer():
-    """Restore _worker_tokenizer to its original value after every test."""
-    original = tokenize_module._worker_tokenizer
+    """Restore all worker globals after every test."""
+    orig_tok       = tokenize_module._worker_tokenizer
+    orig_vocab     = tokenize_module._worker_rust_vocab
+    orig_use_icu4x = tokenize_module._worker_use_icu4x
     yield
-    tokenize_module._worker_tokenizer = original
+    tokenize_module._worker_tokenizer  = orig_tok
+    tokenize_module._worker_rust_vocab = orig_vocab
+    tokenize_module._worker_use_icu4x  = orig_use_icu4x
 
 
 def set_tokenizer(vocab: list[str]) -> SimpleTestTokenizer:
     """Create and install a test tokenizer; return it for further inspection."""
     tok = make_test_tokenizer(vocab)
     tokenize_module._worker_tokenizer = tok
+    # The mock tokenizer is not ICU-based; force the Python fallback path so
+    # that tests are not contaminated by icu4x globals left by other test files.
+    tokenize_module._worker_use_icu4x = False
+    tokenize_module._worker_rust_vocab = None
     return tok
 
 

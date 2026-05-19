@@ -14,25 +14,30 @@ from softmatcha.utils.makefile import make_file
 from softmatcha.utils.custom_tqdm import CustomTqdm
 logger = logging.getLogger(__name__)
 _worker_tokenizer = None
-_worker_rust_vocab = None  # RustVocab built once per worker; None if softmatcha_rs unavailable
+_worker_rust_vocab = None   # RustVocab built once per worker; None if softmatcha_rs unavailable
+_worker_use_icu4x = False   # True when tokenize_and_encode_rs (icu4x) is the active path
 
 
 # =====================================================================================================================
 # Preparation
 # =====================================================================================================================
 def init_worker(tokenizer: Tokenizer, cfg):
-	global _worker_tokenizer, _worker_rust_vocab
+	global _worker_tokenizer, _worker_rust_vocab, _worker_use_icu4x
 	_worker_tokenizer = tokenizer
 	tokenizer.build(cfg)
-	# Build a Rust-native vocab table for the fast encode+offset path.
+	_worker_use_icu4x = False
+	_worker_rust_vocab = None
 	try:
-		from softmatcha_rs import build_rust_vocab
+		from softmatcha_rs import build_rust_vocab, tokenize_and_encode_rs  # noqa: F401
 		_worker_rust_vocab = build_rust_vocab(
 			list(tokenizer.dictionary.items()),
 			tokenizer.unk_idx,
 		)
+		# icu4x path: only for ICU-based tokenizers (exposes get_span_bounds)
+		if hasattr(tokenizer, "get_span_bounds"):
+			_worker_use_icu4x = True
 	except Exception:
-		_worker_rust_vocab = None
+		pass
 
 def tokenize_count(line: str):
 	global _worker_tokenizer
@@ -42,21 +47,26 @@ def tokenize_count(line: str):
 def tokenize_encode_offsets(line: str):
 	"""Tokenize a line and return (token_ids, byte_offsets).
 
-	Fast path (ICU + Rust): if the tokenizer exposes get_span_bounds() and a
-	Rust vocab is available, delegates the encode+offset computation entirely to
-	Rust via encode_and_offsets_rs.  This avoids per-token Python overhead for
-	both the dictionary lookup and the char→byte conversion.
-
-	Fallback (Python): uses tokenize_raw_with_char_offsets + a Python loop.
-	ASCII lines take the char==byte shortcut; non-ASCII lines build a
-	char→byte map via numpy over the encoded bytes.
+	Priority of fast paths (fastest to slowest):
+	1. icu4x Rust: full segmentation in Rust via tokenize_and_encode_rs — zero
+	   Python/C++ per-boundary calls; active when the Rust extension is built and
+	   the tokenizer is ICU-based.
+	2. Python ICU + Rust encode: get_span_bounds (Python ICU) then encode_and_offsets_rs.
+	3. Python fallback: tokenize_raw_with_char_offsets + Python encode loop.
 	"""
-	global _worker_tokenizer, _worker_rust_vocab
+	global _worker_tokenizer, _worker_rust_vocab, _worker_use_icu4x
 	tok = _worker_tokenizer
+
+	if _worker_use_icu4x:
+		# ------------------------------------------------------------------
+		# icu4x Rust path — entire segmentation + encode runs in Rust
+		# ------------------------------------------------------------------
+		from softmatcha_rs import tokenize_and_encode_rs
+		return tokenize_and_encode_rs(line, _worker_rust_vocab)
 
 	if _worker_rust_vocab is not None and hasattr(tok, "get_span_bounds"):
 		# ------------------------------------------------------------------
-		# Rust fast path
+		# Python ICU + Rust encode path
 		# ------------------------------------------------------------------
 		from softmatcha_rs import encode_and_offsets_rs
 		span_starts, span_ends = tok.get_span_bounds(line)

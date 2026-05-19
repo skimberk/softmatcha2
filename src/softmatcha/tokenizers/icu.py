@@ -83,12 +83,12 @@ class TokenizerICU(Tokenizer):
 
 		bi = self._tokenizer.break_iterator
 		bi.setText(stripped)
-		get_status = bi.getRuleStatus
 		word_starts: list[int] = []
 		word_ends: list[int] = []
 		p0 = 0
 		for p1 in bi:
-			if get_status():
+			span = stripped[p0:p1]
+			if span.strip():  # non-whitespace span → include (matches apply_break_iterator)
 				word_starts.append(leading + p0)
 				word_ends.append(leading + p1)
 			p0 = p1
@@ -101,16 +101,10 @@ class TokenizerICU(Tokenizer):
 	def tokenize_raw_with_char_offsets(self, line: str) -> tuple[list[str], list[int]]:
 		"""Capture token char-positions directly from the ICU break iterator.
 
-		The ICU BreakIterator already tracks span boundaries (p0, p1) during
-		tokenization.  The default tokenize_raw() discards those positions and
-		returns only the token strings, forcing tokenize_encode_offsets to
-		re-scan the line with str.find to recover them.  This override keeps p0
-		for every word span, so no second scan is needed.
-
-		getRuleStatus() returns 0 for non-word spans (spaces, punctuation) and
-		non-zero (UBRK_WORD_LETTER=200, UBRK_WORD_NUMBER=400) for word spans.
-		This lets us skip the per-span strip()+find() calls that apply_break_iterator
-		uses, while still correctly filtering out non-word spans.
+		Matches the behavior of apply_break_iterator exactly: includes every
+		span whose content is non-empty after stripping whitespace.  This means
+		punctuation marks (hyphens, periods, etc.) ARE included, exactly as
+		tokenize_raw() does.  Only pure-whitespace spans are dropped.
 
 		Falls back to the base-class implementation if protected_patterns are
 		active (email/URL protection alters the text before the break iterator
@@ -120,18 +114,20 @@ class TokenizerICU(Tokenizer):
 			return super().tokenize_raw_with_char_offsets(line)
 
 		stripped = line.strip()
-		# char offset of 'stripped' within the original 'line'
 		leading = len(line) - len(line.lstrip())
 
 		bi = self._tokenizer.break_iterator
 		bi.setText(stripped)
-		get_status = bi.getRuleStatus  # cache method lookup
 		tokens: list[str] = []
 		char_positions: list[int] = []
 		p0 = 0
 		for p1 in bi:
-			if get_status():  # non-zero = word span; skip spaces/punctuation
+			span = stripped[p0:p1]
+			token = span.strip()
+			if token:
+				# ICU word-break spans never mix content with surrounding whitespace,
+				# so the token always starts at the beginning of the span.
 				char_positions.append(leading + p0)
-				tokens.append(stripped[p0:p1])
+				tokens.append(token)
 			p0 = p1
 		return tokens, char_positions
