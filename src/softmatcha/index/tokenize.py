@@ -3,6 +3,8 @@ import os
 import gc
 import random
 import logging
+import threading
+from queue import Queue as _BufQueue
 import numba as nb
 import numpy as np
 import concurrent.futures
@@ -145,6 +147,21 @@ def _tokenize_encode_offsets_batch(lines_chunk: list[str]):
 		np.concatenate(off_seqs),
 		np.array([len(s) for s in tok_seqs], dtype=np.uint32),
 	)
+
+
+def _prefetch_buffers(q: _BufQueue, input_file: str, total_buf_size: int,
+                      num_chunk: int, chunk: int) -> None:
+	"""Background thread target: feed corpus buffers into a queue.
+
+	Runs buffer_lines() in a daemon thread so that file reading (the Python
+	per-line decode loop) overlaps with ProcessPoolExecutor worker compute.
+	Puts None as a sentinel when the corpus is exhausted.
+	"""
+	try:
+		for buf in buffer_lines(input_file, total_buf_size, num_chunk, chunk):
+			q.put(buf)
+	finally:
+		q.put(None)
 
 
 def get_custom_tqdm(num):
@@ -336,7 +353,22 @@ def tokenize(
 			initargs=(tokenizer, tokenizer.cfg)
 		) as executor:
 			with stopwatch.timers["tokenize"]:
-				for buffer in buffer_lines(input_file, buffer_size*num_workers, num_chunk, chunk):
+				# Read-ahead thread: buffer_lines runs in the background so that
+				# file reading (Python decode loop) overlaps with worker compute.
+				# maxsize=2 keeps one buffer being processed and one pre-read.
+				_prefetch_q: _BufQueue = _BufQueue(maxsize=2)
+				_prefetch_t = threading.Thread(
+					target=_prefetch_buffers,
+					args=(_prefetch_q, input_file, buffer_size * num_workers, num_chunk, chunk),
+					daemon=True,
+				)
+				_prefetch_t.start()
+
+				while True:
+					buffer = _prefetch_q.get()
+					if buffer is None:
+						break
+
 					# Split buffer into per-worker chunks and submit all at once.
 					# Each worker returns (cat_tok, cat_off, lengths) — 3 arrays
 					# instead of one (arr, arr) tuple per line.  This cuts IPC
